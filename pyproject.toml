@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "remote-claude-mailbox"
+version = "0.1.0"
+description = "A Git-backed asynchronous transport for unattended Claude Code sessions."
+requires-python = ">=3.11"
+dependencies = ["Pillow>=11,<13"]
+
+[project.optional-dependencies]
+test = ["pytest>=8,<10"]
+
+[project.scripts]
+remote-claude-client = "client.cli:main"
+remote-claude-server = "server.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["client*", "server*", "common*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["live: tests that call a real external service"]
+addopts = "-ra"

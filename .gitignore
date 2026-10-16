@@ -1,0 +1,31 @@
+# Local environments, configuration, and runtime state
+.venv/
+.runtime/
+/state/
+/client-state/
+/server-state/
+/client.json
+/server.json
+*.log
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+
+# Generated test reports and caches
+/TEST_RESULTS.md
+/test-results/
+/test-reports/
+.pytest_cache/
+.coverage
+.coverage.*
+/coverage.xml
+/coverage.json
+/junit.xml
+htmlcov/
+
+# Python bytecode and build output
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/

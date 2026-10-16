@@ -1,0 +1,7 @@
+{
+  "remote": "git@github.com:YOUR_ACCOUNT/YOUR_REPOSITORY.git",
+  "branch": "mailbox",
+  "state_dir": "~/.local/state/remote-claude/client",
+  "watch_interval": 10,
+  "git_timeout": 30
+}

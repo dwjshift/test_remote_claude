@@ -1,0 +1,20 @@
+{
+  "remote": "git@github.com:YOUR_ACCOUNT/YOUR_REPOSITORY.git",
+  "branch": "mailbox",
+  "state_dir": "~/.local/state/remote-claude/server",
+  "claude_executable": "~/.local/share/claude/versions/2.1.300",
+  "claude_version": "2.1.300",
+  "max_workers": 10,
+  "poll_interval": 60,
+  "heartbeat_interval": 300,
+  "idle_ttl_seconds": 86400,
+  "retry_interval": 1,
+  "git_timeout": 30,
+  "image_budget_bytes": 524288000,
+  "artifact_limits": {
+    "text_limit": 262144,
+    "image_limit": 2097152,
+    "image_count": 10,
+    "turn_image_limit": 10485760
+  }
+}
