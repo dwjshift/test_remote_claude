@@ -12,9 +12,11 @@ For an EC2 instance with an existing Amazon Bedrock Claude installation, follow 
 - Claude Code **2.1.300** on the server, with an existing authenticated account.
 - Repository writers must be trusted to run commands as the server account. Prefer a private repository for private prompts and results.
 
-From the project root:
+Clone the project, then install from its root:
 
 ```bash
+git clone git@github.com:carl-qi/prompt-tooling.git
+cd prompt-tooling
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install -e '.[test]'
@@ -32,7 +34,7 @@ export PATH="$HOME/.local/bin:$PATH"
 hash -r
 claude --version
 claude auth status --json
-git ls-remote git@github.com:YOUR_ACCOUNT/YOUR_REPOSITORY.git
+git ls-remote git@github.com:carl-qi/prompt-tooling.git
 ```
 
 If authentication is missing, run `claude auth login` manually before starting the server. Resolve SSH host-key or credential prompts interactively during setup. The service never performs interactive login.
@@ -45,7 +47,7 @@ The service verifies the configured version and required flags at startup, resol
 
 ### Configuration and Mailbox Initialization
 
-Copy [examples/server.json](examples/server.json), then replace its repository URL and any machine-specific paths:
+Copy [examples/server.json](examples/server.json), then review its repository URL and adjust any machine-specific paths. The examples use `carl-qi/prompt-tooling`; change the remote on both sides if using a different mailbox repository.
 
 ```bash
 mkdir -p .runtime
@@ -58,7 +60,7 @@ Initialize the orphan data branch once using the client:
 
 ```bash
 remote-claude-client --config .runtime/client.json init \
-  --remote git@github.com:YOUR_ACCOUNT/YOUR_REPOSITORY.git \
+  --remote git@github.com:carl-qi/prompt-tooling.git \
   --branch mailbox \
   --state-dir "$HOME/.local/state/remote-claude/client"
 ```
@@ -318,7 +320,7 @@ For real GitHub integration, first verify SSH write access and Claude authentica
 
 ```bash
 python scripts/live_smoke.py \
-  --remote git@github.com:YOUR_ACCOUNT/YOUR_REPOSITORY.git \
+  --remote git@github.com:carl-qi/prompt-tooling.git \
   --budget 1 --timeout 120
 ```
 
@@ -329,7 +331,7 @@ The script creates a uniquely named `test/remote-claude/<run-id>` branch contain
 To clean up a failed test after inspection, copy the exact `branch` from its `report.json`:
 
 ```bash
-git push git@github.com:YOUR_ACCOUNT/YOUR_REPOSITORY.git \
+git push git@github.com:carl-qi/prompt-tooling.git \
   --delete test/remote-claude/EXACT_FAILED_RUN_BRANCH
 ```
 
@@ -350,7 +352,7 @@ Validate the current version through GitHub, using existing noninteractive SSH w
 ```bash
 python scripts/benchmark_mailbox.py \
   --variants current --cases github \
-  --remote git@github.com:YOUR_ACCOUNT/YOUR_REPOSITORY.git \
+  --remote git@github.com:carl-qi/prompt-tooling.git \
   --policy
 ```
 
@@ -373,7 +375,7 @@ python scripts/benchmark_mailbox.py --variants current --cases local --skip-smal
 python scripts/benchmark_mailbox.py --cases local --variants current --policy \
   --run-dir .runtime/benchmarks/example-run
 python scripts/benchmark_mailbox.py --cases github --variants current --policy \
-  --remote git@github.com:YOUR_ACCOUNT/YOUR_REPOSITORY.git \
+  --remote git@github.com:carl-qi/prompt-tooling.git \
   --run-dir .runtime/benchmarks/example-run
 ```
 

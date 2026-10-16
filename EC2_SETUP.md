@@ -21,12 +21,12 @@ Keep credentials, private environment files, databases, caches, raw outputs, and
 
 ## 2. Establish the account, checkout, and local evidence directory
 
-Run the shell examples as the service account, in Bash. The examples use a checkout named `~/test_remote_claude`; adjust every corresponding service path if the actual path differs. Paths in the unit-generation example must not contain whitespace or `%`.
+Run the shell examples as the service account, in Bash. The examples use a checkout named `~/prompt-tooling`; adjust every corresponding service path if the actual path differs. Paths in the unit-generation example must not contain whitespace or `%`.
 
 ```bash
 set -euo pipefail
-export RC_REMOTE='git@github.com:dwjshift/test_remote_claude.git'
-export RC_REPO="$HOME/test_remote_claude"
+export RC_REMOTE='git@github.com:carl-qi/prompt-tooling.git'
+export RC_REPO="$HOME/prompt-tooling"
 export RC_RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-$(python3 -c 'import uuid; print(uuid.uuid4().hex[:8])')"
 export RC_SETUP_DIR="$RC_REPO/.runtime/setup/$RC_RUN_ID"
 export RC_ENV_FILE="$HOME/.config/remote-claude/bedrock.env"
@@ -459,7 +459,7 @@ For the client example, use the actual values in this pattern:
 
 ```bash
 remote-claude-client --config ~/.config/remote-claude/ec2-client.json init \
-  --remote git@github.com:dwjshift/test_remote_claude.git \
+  --remote git@github.com:carl-qi/prompt-tooling.git \
   --branch mailbox --state-dir ~/.local/state/remote-claude/ec2-client
 remote-claude-client --config ~/.config/remote-claude/ec2-client.json new \
   --workspace '~/projects/ACTUAL_EXISTING_PROJECT' \

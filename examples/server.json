@@ -1,5 +1,5 @@
 {
-  "remote": "git@github.com:YOUR_ACCOUNT/YOUR_REPOSITORY.git",
+  "remote": "git@github.com:carl-qi/prompt-tooling.git",
   "branch": "mailbox",
   "state_dir": "~/.local/state/remote-claude/server",
   "claude_executable": "~/.local/share/claude/versions/2.1.300",

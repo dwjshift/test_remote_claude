@@ -2,6 +2,8 @@
 
 Run Claude Code on a Linux machine that can reach GitHub but cannot accept inbound connections. A client submits immutable prompts to a dedicated Git branch; a server runs unattended Claude turns and publishes Markdown responses, diagnostics, and small validated images.
 
+The project repository is [carl-qi/prompt-tooling](https://github.com/carl-qi/prompt-tooling). The configuration examples use this repository for mailbox transport.
+
 **[Installation and usage](USAGE.md)** covers the server, client, local examples, recovery, and testing. Generated validation reports, logs, and runtime state are kept locally and ignored by Git.
 
 **[EC2 and Amazon Bedrock setup](EC2_SETUP.md)** is the execution handoff for the agent on the target instance: preserve existing Bedrock access, adapt and test the code, publish verified model choices, and install the persistent service.
