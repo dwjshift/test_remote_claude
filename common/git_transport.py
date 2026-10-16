@@ -58,6 +58,8 @@ class GitMailbox:
         self._branch_ref = f"refs/heads/{branch}"
         self._lock_path = self.path.parent / f".{self.path.name}.lock"
         self._remote_initialized = False
+        self._validated_head: str | None = None
+        self._change_cache: tuple[str, str, list[tuple[str, str]]] | None = None
         self._run("check-ref-format", self._branch_ref, cwd=self.path.parent)
         with self._locked():
             self._initialize()
@@ -107,7 +109,7 @@ class GitMailbox:
             process = subprocess.Popen(
                 command, cwd=operation_dir if operation_dir.exists() else None,
                 env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace",
+                stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="surrogateescape",
                 start_new_session=True,
             )
             try:
@@ -164,23 +166,67 @@ class GitMailbox:
             f"+{self._branch_ref}:{self._remote_ref}", check=False,
         )
 
-    def _validate_remote_tree(self) -> None:
-        listing = self._run("ls-tree", "-rz", "--full-tree", self._remote_ref).stdout
-        marker_found = False
-        for entry in listing.split("\x00"):
-            if not entry:
-                continue
-            metadata, name = entry.split("\t", 1)
-            mode = metadata.split(" ", 1)[0]
+    def _resolve_commit(self, value: str | None) -> str | None:
+        # Checkpoints are object names, never arbitrary Git revision expressions.
+        if not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", value) is None:
+            return None
+        resolved = self._run("rev-parse", "--verify", f"{value}^{{commit}}", check=False)
+        return resolved.stdout.strip() if resolved.returncode == 0 else None
+
+    def _changes_unlocked(self, base: str | None, head: str) -> list[tuple[str, str]] | None:
+        resolved_head = self._resolve_commit(head)
+        if resolved_head is None:
+            raise GitError("Cannot resolve mailbox HEAD to a commit")
+        resolved_base = self._resolve_commit(base)
+        if resolved_base is None:
+            return None
+        if resolved_base == resolved_head:
+            return []
+        if self._change_cache and self._change_cache[:2] == (resolved_base, resolved_head):
+            return self._change_cache[2]
+        ancestor = self._run("merge-base", "--is-ancestor", resolved_base, resolved_head, check=False)
+        if ancestor.returncode == 1:
+            return None
+        if ancestor.returncode:
+            raise GitError("Cannot inspect mailbox commit ancestry")
+        raw = self._run(
+            "diff-tree", "--raw", "-z", "-r", "--no-renames", "--no-abbrev",
+            "--no-commit-id", "--no-ext-diff", "--no-textconv", resolved_base, resolved_head, "--",
+        ).stdout
+        entries = raw.split("\x00")
+        if entries[-1] != "" or len(entries) % 2 != 1:
+            raise GitError("Malformed mailbox Git diff")
+        changes = []
+        for index in range(0, len(entries) - 1, 2):
+            metadata, name = entries[index:index + 2]
+            fields = metadata.split()
+            if len(fields) != 5 or not fields[0].startswith(":") or fields[4] not in {"A", "D", "M", "T"}:
+                raise GitError("Malformed mailbox Git diff entry")
             self._validate_path(name)
-            if mode == "120000":
-                raise GitError(f"Mailbox symlinks are not supported: {name}")
-            if mode not in {"100644", "100755"}:
-                raise GitError(f"Mailbox entries must be regular files: {name}")
-            marker_found = marker_found or name == ".mailbox.json"
-        if not marker_found:
-            raise GitError("The remote branch is missing its .mailbox.json marker")
-        marker_ref = f"{self._remote_ref}:.mailbox.json"
+            changes.append((name, fields[1]))
+        self._change_cache = (resolved_base, resolved_head, changes)
+        return changes
+
+    def changed_paths(self, base: str | None, head: str | None = None) -> list[str] | None:
+        """Return changed paths, or None when a full discovery is required.
+
+        Renames are reported as deletion and addition. This reads local objects
+        only and never advances the caller's durable ingestion checkpoint.
+        """
+        with self._locked():
+            changes = self._changes_unlocked(base, head if head is not None else self._head_unlocked())
+            return None if changes is None else [name for name, _ in changes]
+
+    @staticmethod
+    def _validate_entry(name: str, mode: str) -> None:
+        GitMailbox._validate_path(name)
+        if mode == "120000":
+            raise GitError(f"Mailbox symlinks are not supported: {name}")
+        if mode not in {"100644", "100755"}:
+            raise GitError(f"Mailbox entries must be regular files: {name}")
+
+    def _validate_marker(self, head: str) -> None:
+        marker_ref = f"{head}:.mailbox.json"
         marker_size = int(self._run("cat-file", "-s", marker_ref).stdout.strip())
         if marker_size > 4096:
             raise GitError("The remote mailbox marker is too large")
@@ -193,6 +239,34 @@ class GitMailbox:
             or marker["schema_version"] != 1 or marker.get("kind") != "remote-claude-mailbox"
         ):
             raise GitError("The remote mailbox marker has an unsupported kind or schema")
+
+    def _validate_remote_tree(self) -> None:
+        head = self._run("rev-parse", "--verify", f"{self._remote_ref}^{{commit}}").stdout.strip()
+        if head == self._validated_head:
+            return
+        changes = self._changes_unlocked(self._validated_head, head)
+        if changes is None:
+            listing = self._run("ls-tree", "-rz", "--full-tree", head).stdout
+            marker_found = False
+            for entry in listing.split("\x00"):
+                if not entry:
+                    continue
+                metadata, name = entry.split("\t", 1)
+                self._validate_entry(name, metadata.split(" ", 1)[0])
+                marker_found = marker_found or name == ".mailbox.json"
+            if not marker_found:
+                raise GitError("The remote branch is missing its .mailbox.json marker")
+            self._validate_marker(head)
+        else:
+            for name, mode in changes:
+                if mode != "000000":
+                    self._validate_entry(name, mode)
+                if name == ".mailbox.json":
+                    if mode == "000000":
+                        raise GitError("The remote branch is missing its .mailbox.json marker")
+                    self._validate_marker(head)
+        # A failed validation must not bless any part of the candidate tree.
+        self._validated_head = head
 
     def _mark_remote_initialized(self) -> None:
         if not self._remote_initialized:
@@ -247,6 +321,9 @@ class GitMailbox:
             self._validate_remote_tree()
             self._run("checkout", "--quiet", "--force", "-B", self.branch, self._remote_ref)
             self._run("clean", "-fdx", "--quiet")
+        else:
+            # This tree was constructed locally from the single known marker.
+            self._validated_head = self._head_unlocked()
 
     def sync(self) -> bool:
         with self._locked():
@@ -256,6 +333,10 @@ class GitMailbox:
     def _validate_path(value: str) -> str:
         if not isinstance(value, str) or not value or any(char in value for char in ("\\", "\x00", "\n", "\r")):
             raise GitError("Mailbox paths must be relative POSIX paths")
+        try:
+            value.encode("utf-8")
+        except UnicodeEncodeError as exc:
+            raise GitError("Mailbox paths must contain valid UTF-8") from exc
         parsed = PurePosixPath(value)
         if parsed.is_absolute() or str(parsed) != value or any(part in {"..", ".git", ".gitattributes", ".gitmodules"} for part in parsed.parts):
             raise GitError(f"Unsafe mailbox path: {value!r}")

@@ -157,6 +157,7 @@ def mailbox_setup(bare_remote, tmp_path, workspace, fake_claude, fake_state):
         "state_dir": str(tmp_path / "server"),
         "claude_executable": str(fake_claude),
         "poll_interval": 0,
+        "adaptive_polling": False,
         "heartbeat_interval": 3600,
         "max_workers": 2,
         "default_timeout": 30,
@@ -599,6 +600,7 @@ def test_dormant_session_resumes_the_original_context(harness):
             "UPDATE sessions SET last_activity=? WHERE session_id=?",
             (time.time() - 90000, session_id),
         )
+    harness.engine._next_idle_sweep = 0
     harness.engine.tick()
     assert harness.engine.store.get_session(session_id)["state"] == "dormant"
     next_id = harness.send(session_id, "Continue after dormancy.", 1)
@@ -628,6 +630,7 @@ def test_crash_requires_explicit_recovery_without_replaying_prompt(
         "state_dir": str(tmp_path / "crashed-server"),
         "claude_executable": str(fake_claude),
         "poll_interval": 0,
+        "adaptive_polling": False,
         "heartbeat_interval": 3600,
         "max_workers": 1,
     }
@@ -711,3 +714,442 @@ with Engine(config, runner=runner) as engine:
                         os.killpg(pid, signal.SIGKILL)
                 except ProcessLookupError:
                     pass
+
+
+def test_adaptive_intervals_use_activity_and_cap_at_base(harness, monkeypatch):
+    engine = harness.engine
+    engine.config.update(adaptive_polling=True, poll_interval=60)
+    now = time.monotonic()
+    monkeypatch.setattr("server.engine.time.monotonic", lambda: now)
+    engine._last_interaction_monotonic = None
+    assert engine._poll_interval() == 60
+    engine._last_interaction_monotonic = now
+    assert engine._poll_interval() == 10
+    now += 300
+    assert engine._poll_interval() == 30
+    now += 300
+    assert engine._poll_interval() == 60
+    engine.config["poll_interval"] = 5
+    engine._last_interaction_monotonic = now
+    assert engine._poll_interval() == 5
+    engine.config.update(adaptive_polling=False, poll_interval=42)
+    assert engine._poll_interval() == 42
+
+
+def test_adaptive_activity_survives_restart_without_heartbeat_reset(mailbox_setup):
+    mailbox_setup.config.update(adaptive_polling=True, poll_interval=60)
+    with Engine(mailbox_setup.config) as engine:
+        last_interaction = time.time() - 350
+        engine.store.set_meta("last_interaction_time", last_interaction)
+    with Engine(mailbox_setup.config) as restarted:
+        assert restarted._poll_interval() == 30
+        assert restarted.store.get_meta("last_interaction_time") == last_interaction
+        restarted._queue_heartbeat()
+        assert restarted.store.get_meta("last_interaction_time") == last_interaction
+
+
+def test_duplicate_inputs_do_not_extend_activity_and_backoff_wins(harness):
+    sid, rid = harness.submit()
+    harness.result(sid, rid)
+    engine = harness.engine
+    engine.config.update(adaptive_polling=True, poll_interval=60)
+    last = engine.store.get_meta("last_interaction_time")
+    engine.mailbox.sync()
+    engine._ingest_request(engine.mailbox.path / f"sessions/{sid}/requests/{rid}.json", sid)
+    assert engine.store.get_meta("last_interaction_time") == last
+    engine._sync_failures = 3
+    deadline = time.monotonic() + 80
+    engine._next_sync = deadline
+    with engine.store.transaction() as db:
+        engine._mark_interaction(db, sid)
+    assert engine._next_sync == deadline
+
+
+def test_output_changes_do_not_read_inputs_or_reload_history(harness, monkeypatch):
+    sid, rid = harness.submit()
+    harness.result(sid, rid)
+    harness.engine.tick()
+    original_activity = harness.engine.store.get_meta("last_interaction_time")
+    harness.client.publish({f"sessions/{sid}/events/synthetic.json": b"{}\n"}, "Publish a synthetic output")
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("Unrelated historical inputs were read")
+
+    monkeypatch.setattr(harness.engine, "_read_json", unexpected)
+    monkeypatch.setattr(harness.engine.store, "list_requests", unexpected)
+    monkeypatch.setattr(harness.engine.store, "list_sessions", unexpected)
+    harness.engine.tick()
+    assert harness.engine.store.get_meta("last_interaction_time") == original_activity
+    assert harness.engine.store.get_meta("ingested_head") == harness.engine._scanned_head
+    harness.engine._next_sync = float("inf")
+    monkeypatch.setattr(harness.engine, "_schedule", unexpected)
+    harness.engine.tick()
+
+
+def test_inputs_arriving_during_publication_are_discovered(harness, monkeypatch):
+    sid, rid = harness.submit()
+    harness.result(sid, rid)
+    engine = harness.engine
+    original_publish = engine.mailbox.publish
+    next_request = harness.request(sid, "Arrived during a server push.", 1)
+    inserted = False
+
+    def publish_with_input(*args, **kwargs):
+        nonlocal inserted
+        if not inserted:
+            inserted = True
+            harness.client.publish({harness.request_path(next_request): canonical_json(next_request)},
+                                   "Insert an input during server publication")
+        return original_publish(*args, **kwargs)
+
+    monkeypatch.setattr(engine.mailbox, "publish", publish_with_input)
+    engine._queue_heartbeat()
+    engine.tick()
+    assert inserted
+    assert engine.store.get_meta("ingested_head") != engine.mailbox.head
+    assert harness.result(sid, next_request["request_id"])["status"] == "completed"
+    assert len(harness.invocations()) == 2
+
+
+def test_request_before_settings_is_backfilled(harness):
+    sid, rid = new_id(), new_id()
+    request = harness.request(sid, "Received before its settings.", request_id=rid)
+    harness.client.publish({harness.request_path(request): canonical_json(request)}, "Publish an early request")
+    harness.engine.tick()
+    assert harness.engine.store.get_request(rid) is None
+    settings = {"schema_version": 1, "session_id": sid, "created_at": utc_now(),
+                "workspace": "~/" + str(harness.workspace.relative_to(Path.home())),
+                "model": "sonnet", "effort": "high", "timeout_seconds": 30}
+    harness.client.publish({f"sessions/{sid}/settings.json": canonical_json(settings)}, "Publish late settings")
+    assert harness.result(sid, rid)["status"] == "completed"
+    assert len(harness.invocations()) == 1
+
+
+def test_partial_ingestion_does_not_run_before_its_cancel(harness, monkeypatch):
+    sid, rid = harness.submit()
+    cid = harness.control(sid, "cancel", request_id=rid)
+    original = harness.engine._ingest_control
+    failed = False
+
+    def interrupted(*args):
+        nonlocal failed
+        if not failed:
+            failed = True
+            raise RuntimeError("Interrupted before processing a same-batch cancellation")
+        return original(*args)
+
+    monkeypatch.setattr(harness.engine, "_ingest_control", interrupted)
+    harness.engine.tick()
+    assert harness.engine.store.get_request(rid)["state"] == "queued"
+    assert harness.engine._ingest_pending
+    harness.engine.tick()
+    assert not harness.invocations()
+    harness.engine._next_sync = 0
+    assert harness.result(sid, rid)["status"] == "cancelled"
+    assert harness.control_result(sid, cid)["status"] == "cancelled"
+    assert not harness.invocations()
+
+
+def test_checkpoint_failure_replays_without_duplicate_execution(harness, monkeypatch):
+    sid, rid = harness.submit()
+    set_meta = harness.engine.store.set_meta
+    failed = False
+
+    def interrupted(key, value):
+        nonlocal failed
+        if key == "ingested_head" and not failed:
+            failed = True
+            raise RuntimeError("Interrupted before checkpoint persistence")
+        return set_meta(key, value)
+
+    monkeypatch.setattr(harness.engine.store, "set_meta", interrupted)
+    harness.engine.tick()
+    assert harness.engine._ingest_pending
+    assert not harness.invocations()
+    harness.engine._next_sync = 0
+    assert harness.result(sid, rid)["status"] == "completed"
+    assert len(harness.invocations()) == 1
+    assert harness.engine.store.get_session(sid)["revision"] == 1
+
+
+def test_restart_waits_for_ingestion_before_running_queued_request(mailbox_setup, monkeypatch):
+    with Engine(mailbox_setup.config) as engine:
+        mailbox_setup.engine = engine
+        sid, rid = mailbox_setup.submit()
+        mailbox_setup.control(sid, "cancel", request_id=rid)
+        engine.mailbox.sync()
+        original = engine._ingest_control
+
+        def interrupted(*args):
+            raise RuntimeError("Simulated interruption between input records")
+
+        monkeypatch.setattr(engine, "_ingest_control", interrupted)
+        with pytest.raises(RuntimeError):
+            engine._discover()
+        monkeypatch.setattr(engine, "_ingest_control", original)
+    with Engine(mailbox_setup.config) as restarted:
+        mailbox_setup.engine = restarted
+        sync = restarted.mailbox.sync
+
+        def unavailable():
+            raise OSError("The remote is temporarily unavailable")
+
+        monkeypatch.setattr(restarted.mailbox, "sync", unavailable)
+        restarted.tick()
+        assert not mailbox_setup.invocations()
+        assert restarted.store.get_request(rid)["state"] == "queued"
+        monkeypatch.setattr(restarted.mailbox, "sync", sync)
+        restarted._next_sync = 0
+        assert mailbox_setup.result(sid, rid)["status"] == "cancelled"
+        assert not mailbox_setup.invocations()
+
+
+@pytest.mark.parametrize("input_kind", ["settings", "request", "control"])
+def test_transient_input_read_error_does_not_advance_checkpoint(harness, monkeypatch, input_kind):
+    sid, rid = harness.submit()
+    if input_kind == "control":
+        harness.control(sid, "cancel", request_id=rid)
+    original = harness.engine._read_json
+    old_head = harness.engine._scanned_head
+    failed = False
+
+    def interrupted(path):
+        nonlocal failed
+        selected = (path.name == "settings.json" if input_kind == "settings" else
+                    path.parent.name == input_kind + "s")
+        if selected and not failed:
+            failed = True
+            raise OSError("Transient input read failure")
+        return original(path)
+
+    monkeypatch.setattr(harness.engine, "_read_json", interrupted)
+    harness.engine.tick()
+    assert failed
+    assert harness.engine._scanned_head == old_head
+    assert not harness.invocations()
+    harness.engine._next_sync = 0
+    status = "cancelled" if input_kind == "control" else "completed"
+    assert harness.result(sid, rid)["status"] == status
+    assert len(harness.invocations()) == int(input_kind != "control")
+
+
+def test_single_input_among_one_thousand_sessions_reads_only_that_input(harness, monkeypatch):
+    from common.protocol import content_hash
+
+    engine = harness.engine
+    files = {}
+    sessions = []
+    with engine.store.transaction() as db:
+        for index in range(1000):
+            sid = str(uuid.UUID(int=index + 1))
+            rid = str(uuid.UUID(int=index + 1001))
+            settings = {"schema_version": 1, "session_id": sid, "created_at": utc_now(),
+                        "workspace": "~/" + str(harness.workspace.relative_to(Path.home())),
+                        "model": "sonnet", "effort": "high", "timeout_seconds": 30}
+            request = harness.request(sid, "An already completed historical request.", request_id=rid)
+            files[f"sessions/{sid}/settings.json"] = canonical_json(settings)
+            files[harness.request_path(request)] = canonical_json(request)
+            db.execute("INSERT INTO sessions(session_id,settings_json,settings_hash,workspace,claude_session_id,revision,state,last_activity,created_at) VALUES (?,?,?,?,?,1,'dormant',0,?)",
+                       (sid, canonical_json(settings).decode(), content_hash(settings), str(harness.workspace), new_id(), utc_now()))
+            db.execute("INSERT INTO requests(request_id,session_id,body_json,body_hash,state,accepted,received_at) VALUES (?,?,?,?,'completed',1,?)",
+                       (rid, sid, canonical_json(request).decode(), content_hash(request), utc_now()))
+            sessions.append(sid)
+    harness.client.publish(files, "Seed one thousand historical sessions")
+    engine._scanned_head = harness.client.head
+    engine.store.set_meta("ingested_head", engine._scanned_head)
+    engine.tick()
+    request = harness.request(sessions[-1], "Only this new input should be read.", 1)
+    harness.client.publish({harness.request_path(request): canonical_json(request)}, "Append one incremental input")
+    original = engine._read_json
+    read = []
+
+    def counted(path):
+        read.append(path)
+        return original(path)
+
+    monkeypatch.setattr(engine, "_read_json", counted)
+    engine.tick()
+    assert read == [engine.mailbox.path / harness.request_path(request)]
+    assert harness.result(sessions[-1], request["request_id"])["status"] == "completed"
+    assert len(harness.invocations()) == 1
+
+
+def test_full_scan_fallback_does_not_reexecute_history(harness, monkeypatch):
+    sid, rid = harness.submit()
+    harness.result(sid, rid)
+    engine = harness.engine
+    engine._scanned_head = "a" * 40
+    engine.store.set_meta("ingested_head", engine._scanned_head)
+    read = []
+    original = engine._read_json
+
+    def counted(path):
+        read.append(path)
+        return original(path)
+
+    monkeypatch.setattr(engine, "_read_json", counted)
+    engine.tick()
+    assert len(read) == 2
+    assert len(harness.invocations()) == 1
+    assert engine.store.get_session(sid)["revision"] == 1
+
+
+def test_deleted_and_readded_request_is_not_reexecuted(harness):
+    sid, rid = harness.submit()
+    harness.result(sid, rid)
+    relative = f"sessions/{sid}/requests/{rid}.json"
+    payload = (harness.client.path / relative).read_bytes()
+    harness.client._run("rm", "--", relative)
+    harness.client._run("commit", "-m", "Delete an immutable input externally")
+    harness.client._run("push", "origin", "HEAD:refs/heads/mailbox")
+    harness.engine.tick()
+    assert harness.engine.store.get_request(rid)["state"] == "completed"
+    harness.client.publish({relative: payload}, "Restore a historical request")
+    harness.engine.tick()
+    assert len(harness.invocations()) == 1
+    assert harness.engine.store.get_session(sid)["revision"] == 1
+
+
+def test_changed_settings_do_not_change_workspace_or_model(harness):
+    sid, rid = harness.submit()
+    harness.result(sid, rid)
+    original = harness.engine.store.get_session(sid)
+    settings = json.loads(original["settings_json"])
+    settings["model"] = "unexpected-model"
+    relative = f"sessions/{sid}/settings.json"
+    harness.client.publish({relative: canonical_json(settings)}, "Edit immutable settings externally", mutable_paths={relative})
+    harness.engine.tick()
+    assert harness.engine.store.get_session(sid)["settings_json"] == original["settings_json"]
+    assert len(harness.invocations()) == 1
+
+
+def test_restart_recovery_does_not_load_terminal_requests(mailbox_setup, monkeypatch):
+    from server.store import Store
+
+    with Engine(mailbox_setup.config) as engine:
+        mailbox_setup.engine = engine
+        sid, rid = mailbox_setup.submit()
+        mailbox_setup.result(sid, rid)
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("Startup loaded all historical requests")
+
+    monkeypatch.setattr(Store, "list_requests", unexpected)
+    with Engine(mailbox_setup.config) as restarted:
+        assert restarted.store.get_request(rid)["state"] == "completed"
+        restarted.tick()
+    assert len(mailbox_setup.invocations()) == 1
+
+
+def test_backoff_starts_after_failed_fetch_finishes(harness, monkeypatch):
+    now = 1000.0
+    monkeypatch.setattr("server.engine.time.monotonic", lambda: now)
+
+    def timeout():
+        nonlocal now
+        now += 30
+        raise OSError("Fetch reached its timeout")
+
+    monkeypatch.setattr(harness.engine.mailbox, "sync", timeout)
+    harness.engine.tick()
+    assert harness.engine._next_sync == 1031.0
+
+
+@pytest.mark.parametrize("restart", [False, True])
+def test_rejected_request_recovers_interrupted_result_publication(mailbox_setup, monkeypatch, restart):
+    with Engine(mailbox_setup.config) as engine:
+        mailbox_setup.engine = engine
+        sid, first_id = mailbox_setup.submit()
+        mailbox_setup.result(sid, first_id)
+        rejected_id = mailbox_setup.send(sid, "This request has a stale revision.", 0)
+        finalize = engine._finalize
+
+        def interrupted(rid, outcome, **kwargs):
+            if rid == rejected_id:
+                raise OSError("Interruption after persisting the rejection decision")
+            return finalize(rid, outcome, **kwargs)
+
+        monkeypatch.setattr(engine, "_finalize", interrupted)
+        engine.tick()
+        request = engine.store.get_request(rejected_id)
+        assert request["accepted"] == 0
+        assert request["result_json"] is None
+        assert "expected_revision" in request["rejection_error"]
+        monkeypatch.setattr(engine, "_finalize", finalize)
+        if not restart:
+            engine._next_sync = 0
+            result = mailbox_setup.result(sid, rejected_id)
+            assert result["status"] == "rejected"
+            assert "expected_revision" in result["error"]
+            assert engine.store.get_session(sid)["revision"] == 1
+    if restart:
+        with Engine(mailbox_setup.config) as engine:
+            mailbox_setup.engine = engine
+            result = mailbox_setup.result(sid, rejected_id)
+            assert result["status"] == "rejected"
+            assert "expected_revision" in result["error"]
+            assert engine.store.get_session(sid)["revision"] == 1
+    assert len(mailbox_setup.invocations()) == 1
+
+
+def test_idle_sweep_runs_at_most_once_per_minute(harness, monkeypatch):
+    calls = []
+    original = harness.engine.store.dormant_candidates
+
+    def counted(cutoff):
+        calls.append(cutoff)
+        return original(cutoff)
+
+    monkeypatch.setattr(harness.engine.store, "dormant_candidates", counted)
+    harness.engine.tick()
+    harness.engine._next_sync = float("inf")
+    for _ in range(20):
+        harness.engine.tick()
+    assert len(calls) == 1
+    harness.engine._next_idle_sweep = 0
+    harness.engine.tick()
+    assert len(calls) == 2
+
+
+def test_running_or_queued_requests_keep_adaptive_polling_active(harness):
+    sid, rid = harness.submit(json.dumps({"fake": "hang"}))
+    harness.engine.mailbox.sync()
+    harness.engine._discover()
+    harness.engine.config.update(adaptive_polling=True, poll_interval=60)
+    harness.engine._last_interaction_monotonic = time.monotonic() - 3600
+    assert harness.engine.store.get_request(rid)["state"] == "queued"
+    assert harness.engine._poll_interval() == 10
+    harness.engine.tick()
+    assert harness.engine._poll_interval() == 10
+    harness.engine.config.update(adaptive_polling=False, poll_interval=0)
+    harness.engine._next_sync = 0
+    harness.control(sid, "cancel", request_id=rid)
+    assert harness.result(sid, rid)["status"] == "cancelled"
+
+
+def test_interrupted_rejection_finishes_after_input_is_deleted(harness, monkeypatch):
+    sid, first_id = harness.submit()
+    harness.result(sid, first_id)
+    rejected_id = harness.send(sid, "This stale request will be deleted externally.", 0)
+    finalize = harness.engine._finalize
+
+    def interrupted(rid, outcome, **kwargs):
+        if rid == rejected_id:
+            raise OSError("Interruption after persisting the rejection decision")
+        return finalize(rid, outcome, **kwargs)
+
+    monkeypatch.setattr(harness.engine, "_finalize", interrupted)
+    harness.engine.tick()
+    assert harness.engine.store.get_request(rejected_id)["result_json"] is None
+    relative = f"sessions/{sid}/requests/{rejected_id}.json"
+    harness.client.sync()
+    harness.client._run("rm", "--", relative)
+    harness.client._run("commit", "-m", "Remove a rejected input before server retry")
+    harness.client._run("push", "origin", "HEAD:refs/heads/mailbox")
+    monkeypatch.setattr(harness.engine, "_finalize", finalize)
+    harness.engine._next_sync = 0
+    result = harness.result(sid, rejected_id)
+    assert result["status"] == "rejected"
+    assert "expected_revision" in result["error"]
+    assert harness.engine.store.get_session(sid)["revision"] == 1
+    assert len(harness.invocations()) == 1

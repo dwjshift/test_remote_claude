@@ -100,7 +100,7 @@ def test_server_cli_sigterm_cancels_worker_and_publishes_result(
     capsys.readouterr()
     save_config(server_config, {
         "remote": str(bare_remote), "state_dir": "server-state",
-        "claude_executable": str(fake_claude), "poll_interval": 0,
+        "claude_executable": str(fake_claude), "poll_interval": 0, "adaptive_polling": False,
         "heartbeat_interval": 3600,
     })
     process = None

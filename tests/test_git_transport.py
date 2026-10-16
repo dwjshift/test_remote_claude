@@ -161,3 +161,151 @@ def test_cache_lock_times_out_instead_of_overlapping_git_operations(tmp_path, tr
     with mailbox._locked():
         with pytest.raises(GitError, match="checkout lock"):
             mailbox.sync()
+
+
+def record_git_commands(monkeypatch, mailbox):
+    commands = []
+    original = mailbox._run
+
+    def run(*args, **kwargs):
+        commands.append(args)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(mailbox, "_run", run)
+    return commands
+
+
+def test_unchanged_head_skips_tree_validation_but_cleans_cache(tmp_path, transport_remote, monkeypatch):
+    mailbox = GitMailbox(transport_remote, "mailbox", tmp_path / "checkout", create=True)
+    commands = record_git_commands(monkeypatch, mailbox)
+    (mailbox.path / ".mailbox.json").write_text("Local edits must be discarded.")
+    (mailbox.path / "untracked.txt").write_text("Temporary content.")
+    assert mailbox.sync() is False
+    assert not any(command[0] in {"ls-tree", "diff-tree", "cat-file", "show"} for command in commands)
+    assert not (mailbox.path / "untracked.txt").exists()
+    assert '"schema_version":1' in (mailbox.path / ".mailbox.json").read_text()
+
+
+def test_reopening_cache_always_validates_complete_tree(tmp_path, transport_remote, monkeypatch):
+    mailbox = GitMailbox(transport_remote, "mailbox", tmp_path / "checkout", create=True)
+    original = GitMailbox._run
+    commands = []
+
+    def run(self, *args, **kwargs):
+        commands.append(args)
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(GitMailbox, "_run", run)
+    reopened = GitMailbox(transport_remote, "mailbox", mailbox.path)
+    assert sum(command[0] == "ls-tree" for command in commands) == 1
+    commands.clear()
+    reopened.sync()
+    assert not any(command[0] == "ls-tree" for command in commands)
+
+
+def test_changed_paths_reports_add_modify_delete_without_rename_folding(tmp_path, transport_remote, monkeypatch):
+    mailbox = GitMailbox(transport_remote, "mailbox", tmp_path / "first", create=True)
+    base = mailbox.publish({"old.txt": b"move\n", "delete.txt": b"delete\n", "modify.txt": b"before\n"}, "Seed")
+    mailbox.sync()
+    publisher = GitMailbox(transport_remote, "mailbox", tmp_path / "second")
+    publisher._run("mv", "--", "old.txt", "new.txt")
+    publisher._run("rm", "--", "delete.txt")
+    (publisher.path / "modify.txt").write_bytes(b"after\n")
+    (publisher.path / "tab\tname.txt").write_bytes(b"new\n")
+    publisher._run("add", "--all")
+    publisher._run("commit", "--quiet", "-m", "Change mailbox files")
+    publisher._run("push", "--quiet", "origin", "HEAD:refs/heads/mailbox")
+    commands = record_git_commands(monkeypatch, mailbox)
+    assert mailbox.sync() is True
+    assert set(mailbox.changed_paths(base)) == {"delete.txt", "old.txt", "new.txt", "modify.txt", "tab\tname.txt"}
+    assert not any(command[0] == "ls-tree" for command in commands)
+    # Validation and discovery can reuse the same raw diff safely.
+    assert sum(command[0] == "diff-tree" for command in commands) == 1
+    assert mailbox.changed_paths(mailbox.head) == []
+
+
+def test_output_only_commit_lists_only_output_paths(tmp_path, transport_remote):
+    mailbox = GitMailbox(transport_remote, "mailbox", tmp_path / "first", create=True)
+    base = mailbox.head
+    output = "sessions/example/responses/request/answer.md"
+    head = mailbox.publish({output: b"A response.\n", "_server/status.json": b"{}\n"}, "Output")
+    assert mailbox.changed_paths(base, head) == ["_server/status.json", output]
+
+
+@pytest.mark.parametrize("base", [None, "", "0" * 40, "--all", "HEAD", "HEAD~1"])
+def test_missing_or_invalid_checkpoint_requires_full_discovery(tmp_path, transport_remote, base):
+    mailbox = GitMailbox(transport_remote, "mailbox", tmp_path / "checkout", create=True)
+    assert mailbox.changed_paths(base) is None
+    with pytest.raises(GitError, match="resolve mailbox HEAD"):
+        mailbox.changed_paths(mailbox.head, "--all")
+
+
+def test_rewritten_history_falls_back_to_complete_validation_and_discovery(tmp_path, transport_remote, monkeypatch):
+    mailbox = GitMailbox(transport_remote, "mailbox", tmp_path / "checkout", create=True)
+    original_head = mailbox.head
+    newer = mailbox.publish({"later.txt": b"later\n"}, "Later")
+    mailbox.sync()
+    subprocess.run(
+        ["git", "--git-dir", transport_remote, "update-ref", "refs/heads/mailbox", original_head], check=True,
+    )
+    commands = record_git_commands(monkeypatch, mailbox)
+    assert mailbox.sync() is True
+    assert mailbox.changed_paths(newer) is None
+    assert sum(command[0] == "ls-tree" for command in commands) == 1
+    assert not (mailbox.path / "later.txt").exists()
+
+
+def test_missing_validated_commit_falls_back_to_complete_validation(tmp_path, transport_remote, monkeypatch):
+    mailbox = GitMailbox(transport_remote, "mailbox", tmp_path / "checkout", create=True)
+    mailbox._validated_head = "0" * 40
+    commands = record_git_commands(monkeypatch, mailbox)
+    mailbox.sync()
+    assert sum(command[0] == "ls-tree" for command in commands) == 1
+
+
+@pytest.mark.parametrize("unsafe", ["symlink", "gitlink", "attributes", "modules", "newline", "invalid_utf8", "marker_deleted", "marker_invalid", "marker_large"])
+def test_incremental_validation_rejects_unsafe_change_before_checkout(tmp_path, transport_remote, unsafe):
+    mailbox = GitMailbox(transport_remote, "mailbox", tmp_path / "reader", create=True)
+    validated_head = mailbox.head
+    writer = GitMailbox(transport_remote, "mailbox", tmp_path / "writer")
+    if unsafe == "symlink":
+        (writer.path / "link").symlink_to(tmp_path / "outside")
+    elif unsafe == "gitlink":
+        writer._run("update-index", "--add", "--cacheinfo", f"160000,{writer.head},submodule")
+    elif unsafe == "attributes":
+        (writer.path / ".gitattributes").write_text("* filter=untrusted\n")
+    elif unsafe == "modules":
+        (writer.path / ".gitmodules").write_text("Untrusted submodule configuration.\n")
+    elif unsafe == "newline":
+        (writer.path / "line\nbreak.txt").write_text("Invalid filename.\n")
+    elif unsafe == "invalid_utf8":
+        (writer.path / "invalid\udcff.txt").write_text("Invalid filename.\n")
+    elif unsafe == "marker_deleted":
+        (writer.path / ".mailbox.json").unlink()
+    elif unsafe == "marker_invalid":
+        (writer.path / ".mailbox.json").write_text('{"kind":"wrong","schema_version":1}\n')
+    else:
+        (writer.path / ".mailbox.json").write_text(" " * 4097)
+    if unsafe != "gitlink":
+        writer._run("add", "--all")
+    writer._run("commit", "--quiet", "-m", "Unsafe mailbox fixture")
+    writer._run("push", "--quiet", "origin", "HEAD:refs/heads/mailbox")
+    with pytest.raises(GitError):
+        mailbox.sync()
+    assert mailbox.head == validated_head
+    assert mailbox._validated_head == validated_head
+    assert not (mailbox.path / "link").is_symlink()
+    assert not (mailbox.path / "submodule").exists()
+
+
+def test_valid_marker_update_is_checked_incrementally(tmp_path, transport_remote, monkeypatch):
+    mailbox = GitMailbox(transport_remote, "mailbox", tmp_path / "first", create=True)
+    publisher = GitMailbox(transport_remote, "mailbox", tmp_path / "second")
+    publisher.publish(
+        {".mailbox.json": b'{"kind":"remote-claude-mailbox","schema_version":1,"note":"valid"}\n'},
+        "Update marker", mutable_paths={".mailbox.json"},
+    )
+    commands = record_git_commands(monkeypatch, mailbox)
+    mailbox.sync()
+    assert not any(command[0] == "ls-tree" for command in commands)
+    assert sum(command[0] == "cat-file" for command in commands) == 1

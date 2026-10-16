@@ -13,6 +13,7 @@ Run Claude Code on a Linux machine that can reach GitHub but cannot accept inbou
 | `common/` | Versioned protocol, configuration, and retrying Git transport |
 | `tests/` | Unit tests and offline integration tests with real Git and a fake Claude process |
 | `scripts/live_smoke.py` | Opt-in real Claude and isolated GitHub integration checks |
+| `scripts/benchmark_mailbox.py` | Reproducible local and GitHub pressure tests, with optional baseline comparison |
 | `examples/` | English client and server JSON configurations |
 
 Code lives on `main`. The separate orphan `mailbox` branch contains `.mailbox.json`, `sessions/`, and low-frequency server status. Runtime databases, raw logs, caches, credentials, and native Claude histories stay outside the data branch.
@@ -23,6 +24,8 @@ Code lives on `main`. The separate orphan `mailbox` branch contains `.mailbox.js
 - New session and request IDs start with a second-precision timestamp in fixed PST (UTC-08:00). Responses share their request ID; existing UUID identifiers remain supported.
 - One unfinished request per conversation; explicit revisions and deterministic conflict rejection.
 - Up to ten concurrent turns in independent workspaces. Equal or nested workspaces are serialized. Idle conversations keep their history without retaining a Claude process.
+- One central poller uses 60 seconds when idle, 30 seconds after recent interaction, and 10 seconds during active work. Results are published as soon as they are ready.
+- Commit differences identify new inputs; indexed SQLite queries keep completed history out of routine scheduling. Durable ingestion checkpoints are separate from Git validation and publication.
 - Durable results and a SQLite publication outbox. Network retries never rerun a completed request.
 - Interrupted executions become `unknown` and freeze the workspace until an explicit recovery closes the interrupted request.
 - Markdown and small PNG, JPEG, or WebP attachments; large data stays on the server.

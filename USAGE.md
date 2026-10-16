@@ -73,7 +73,10 @@ Run **exactly one server with one persistent state directory per mailbox branch*
 | `claude_executable` | `claude` | Executable path; the example pins the native 2.1.300 file |
 | `claude_version` | `2.1.300` | Required version, checked with required CLI flags |
 | `max_workers` | `10` | Maximum concurrent turns; excess work waits |
-| `poll_interval` | `60` | Seconds between remote polls |
+| `poll_interval` | `60` | Idle polling interval and upper bound for adaptive intervals; fixed interval when adaptation is disabled |
+| `adaptive_polling` | `true` | Adjust the central polling interval according to activity |
+| `active_poll_interval` | `10` | Polling interval while work is queued/running or interaction occurred less than five minutes ago |
+| `warm_poll_interval` | `30` | Polling interval when the latest interaction was five to ten minutes ago |
 | `heartbeat_interval` | `300` | Seconds between server heartbeat snapshots |
 | `idle_ttl_seconds` | `86400` | Idle time before a conversation becomes dormant |
 | `retry_interval` | `1` | Initial publication retry delay; exponential backoff caps at 300 seconds |
@@ -95,7 +98,15 @@ remote-claude-server --config .runtime/server.json serve
 
 Keep the server in the foreground for local use. Press **Ctrl+C**, or send **SIGTERM** to the server PID, to stop normally. Active turns are cancelled and their process groups are cleaned up; results are persisted and publication is attempted. Queued requests and unpublished results remain in SQLite for the next start.
 
-The server polls Git once per interval and scans messages only when the observed HEAD changes. Workers never push. One publisher commits final Markdown, metadata, and all accepted attachments together. Push conflicts are fetched and retried without force-pushing. Network failures leave durable results waiting for publication.
+One central poller serves every session. It synchronizes immediately at startup and then uses elapsed monotonic time, without aligning requests to wall-clock minute boundaries. With the defaults, queued/running work or interaction within five minutes selects 10 seconds; interaction five to ten minutes ago selects 30 seconds; longer inactivity selects 60 seconds. New requests, new controls, and task completion count as interaction. Duplicate messages, heartbeats, and ordinary status publications do not. Recent activity survives a server restart.
+
+Adaptive intervals are capped at `poll_interval`. Set `adaptive_polling` to `false` for a fixed interval. Adaptive intervals must be positive; zero is supported only in fixed mode for offline tests. Network failures use exponential backoff independently of activity, and a task completing during a synchronization outage does not override that backoff. Result publication does not wait for the next scheduled input poll. Client `watch` still polls every ten seconds by default.
+
+The server reads changed settings, requests, and controls from Git commit differences. An unchanged HEAD skips message discovery and repeat full-tree validation; commits containing only responses, events, attachments, or heartbeats do not cause historical input JSON to be parsed. A durable SQLite ingestion checkpoint advances only after the input batch is handled. Publisher fetches and pushes never advance that checkpoint, so requests arriving during publication remain discoverable. Missing checkpoints, unavailable Git objects, or rewritten history trigger a safe full scan with request deduplication.
+
+Each newly opened Git cache performs complete tree validation. Subsequent changes retain path, file-type, and mailbox-marker checks before checkout. Checkout and disposable-cache cleanup still run, so Git index and filesystem work can depend on repository size even when application-level history scanning is eliminated. Short-lived client commands open a cache each time and retain the initial validation cost.
+
+Workers never push. One publisher commits final Markdown, metadata, and all accepted attachments together. Push conflicts are fetched and retried without force-pushing. Network failures leave durable results waiting for publication. Scheduling reads indexed queued/running/unknown records, and dormancy is checked once per minute. Existing ledgers are upgraded automatically, including a transactional image-budget counter and recovery of interrupted rejection results; retain the same state directory during an upgrade.
 
 ### Workspaces and Unattended Execution
 
@@ -317,6 +328,54 @@ git push git@github.com:YOUR_ACCOUNT/YOUR_REPOSITORY.git \
 ```
 
 Never substitute `main`, `master`, or your production mailbox. Generated verification records such as `TEST_RESULTS.md` and `.runtime/live/*/report.json` remain local and are ignored by Git; run the commands above to produce reports for your own checkout.
+
+### Pressure Tests
+
+The benchmark uses real client send/show handlers, Git operations, SQLite, and fake Claude subprocesses with a fixed 100 ms delay. Client handlers run in process, so Python interpreter startup is excluded. It makes no model API calls. Run it from a checkout under the server account's home, with test dependencies installed. A full run retains several gigabytes of generated files; keep sufficient free disk space and avoid running other tests during timed samples.
+
+Validate the current version locally:
+
+```bash
+python scripts/benchmark_mailbox.py --variants current --cases local --policy
+```
+
+Validate the current version through GitHub, using existing noninteractive SSH write access:
+
+```bash
+python scripts/benchmark_mailbox.py \
+  --variants current --cases github \
+  --remote git@github.com:YOUR_ACCOUNT/YOUR_REPOSITORY.git \
+  --policy
+```
+
+The default corpus has 1,000 sessions with ten completed turns each: 10,000 requests, 30,000 events, 40,000 published outbox entries, and 20,001 Git commits. The last ten sessions remain active in separate workspaces. Historical prompts are 1 KiB and answers are 4 KiB, with distinct synthetic content and no images. The script builds matching Git history, SQLite state, and fake native session histories; historical model calls are not replayed. Fixture preparation and submission-cache priming are outside the request latency measurements. The first result observer opens its cache during the measured request, so that initial fetch remains included in the first sample and maximum latency.
+
+The current version uses the working tree in an isolated process. Local runs also include a ten-session control. Each full case measures 100 idle ticks, unchanged-HEAD synchronization (30 local or 10 GitHub samples), 30 sequential requests, five batches of ten simultaneous submissions, ten output-only changes, and three restarts. Concurrent clients use independent caches and real competing pushes. Ordinary request samples make server synchronization due after submission, separating processing latency from the polling interval.
+
+`--policy` additionally seeds recent-activity ages to select the actual 10/30/60-second policy intervals, waits each full interval using the real clock, and runs the real client `watch` command at ten seconds. These samples include polling waits and are separate from processing benchmarks. They test specified polling phases, rather than estimate average latency for randomly timed arrivals. Restart samples time `Engine.start`; the subsequent synchronization is performed separately.
+
+For a quick fixture and end-to-end check:
+
+```bash
+python scripts/benchmark_mailbox.py --variants current --cases local --skip-small \
+  --sessions 2 --history-turns 2 --active 2 --quick
+```
+
+`--sessions`, `--history-turns`, and `--active` adjust the corpus. An optional comparison is available with `--variants both` (the script default); `--variants baseline` selects only the archived baseline. `--baseline-ref` selects an available Git commit, defaulting to `a438da6`, which also supplies the historical ledger schema for upgrade testing. Both variants use the same corpus. `--cases github` runs only full-size GitHub cases and requires `--remote`. `--run-dir PATH` permits staged execution with the same fixtures, for example:
+
+```bash
+python scripts/benchmark_mailbox.py --cases local --variants current --policy \
+  --run-dir .runtime/benchmarks/example-run
+python scripts/benchmark_mailbox.py --cases github --variants current --policy \
+  --remote git@github.com:YOUR_ACCOUNT/YOUR_REPOSITORY.git \
+  --run-dir .runtime/benchmarks/example-run
+```
+
+Completed cases are reused only when their parameters and source identity match. Changing the baseline, measured source, sample counts, or policy settings requires a new run directory. Failed cases remain available for diagnosis and also require a new directory for a fresh run.
+
+Reports are written under `.runtime/benchmarks/RUN_ID/`: `REPORT.md` summarizes cases, `report.json` retains results, and `samples.csv` contains individual samples. Each case also has its configuration, raw timing events, attempt status, resource usage, and any watch logs. Measurements distinguish submission, batch waiting, polling, server fetch/validation/discovery, queueing, execution, persistence, publication, and client visibility. Summaries include sample counts, p50, p95, maximum, and success rate. Git durations from concurrent clients can overlap and must not be added to reconstruct wall time. Concurrent result observation waits for the complete batch; compare batch completion as well as individual submission latency. CPU includes waited-for children; parent and child peak RSS are reported separately rather than summed.
+
+GitHub cases use unique `test/remote-claude/perf-RUN_ID-CASE` branches containing the complete synthetic history. They verify that `main`, `master`, and `mailbox` refs remain unchanged. Successful cases delete their test branches and verify removal. Failed cases retain their branch and an exact `cleanup_command` in the case report. All generated histories, databases, logs, and benchmark reports are ignored by Git; only the benchmark source and tests are committed. These measurements describe the tested machine and network, not AWS performance or real Claude response time.
 
 ## Troubleshooting and Current Scope
 

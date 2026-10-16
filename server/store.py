@@ -37,7 +37,8 @@ class Store:
                 body_json TEXT NOT NULL, body_hash TEXT NOT NULL,
                 state TEXT NOT NULL, accepted INTEGER NOT NULL,
                 received_at TEXT NOT NULL, started_at TEXT, ended_at TEXT,
-                pid INTEGER, process_start TEXT, process_boot TEXT, result_json TEXT
+                pid INTEGER, process_start TEXT, process_boot TEXT, result_json TEXT,
+                rejection_error TEXT
             );
             CREATE TABLE IF NOT EXISTS controls (
                 control_id TEXT PRIMARY KEY, body_hash TEXT NOT NULL, result_json TEXT NOT NULL
@@ -54,7 +55,23 @@ class Store:
             );
             CREATE INDEX IF NOT EXISTS requests_state ON requests(state);
             CREATE INDEX IF NOT EXISTS requests_session ON requests(session_id);
+            CREATE INDEX IF NOT EXISTS requests_incomplete_rejections ON requests(request_id)
+                WHERE state='rejected' AND accepted=0 AND result_json IS NULL;
+            CREATE INDEX IF NOT EXISTS outbox_pending ON outbox(published, id);
+            CREATE INDEX IF NOT EXISTS sessions_idle ON sessions(state, closed, last_activity);
         """)
+        # Existing ledgers are upgraded once. The counter includes reservations
+        # and intentionally never refunds bytes when an image record is removed.
+        with self.transaction() as db:
+            if "rejection_error" not in {row[1] for row in db.execute("PRAGMA table_info(requests)")}:
+                db.execute("ALTER TABLE requests ADD COLUMN rejection_error TEXT")
+            if db.execute("SELECT 1 FROM metadata WHERE key='image_bytes'").fetchone() is None:
+                db.execute("INSERT INTO metadata(key,value) SELECT 'image_bytes', CAST(COALESCE(SUM(size),0) AS TEXT) FROM image_ledger")
+            db.execute("""CREATE TRIGGER IF NOT EXISTS image_bytes_reserved
+                AFTER INSERT ON image_ledger BEGIN
+                    UPDATE metadata SET value=CAST(CAST(value AS INTEGER)+NEW.size AS TEXT)
+                    WHERE key='image_bytes';
+                END""")
 
     @contextlib.contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:
@@ -103,8 +120,42 @@ class Store:
             return [dict(row) for row in rows]
 
     def image_bytes(self) -> int:
+        return self.get_meta("image_bytes", 0)
+
+    def queued_requests(self) -> list[dict]:
         with self.lock:
-            return self.connection.execute("SELECT COALESCE(SUM(size),0) FROM image_ledger").fetchone()[0]
+            return [dict(row) for row in self.connection.execute(
+                "SELECT * FROM requests WHERE state='queued' ORDER BY rowid")]
+
+    def running_requests(self) -> list[dict]:
+        with self.lock:
+            return [dict(row) for row in self.connection.execute(
+                "SELECT * FROM requests WHERE state='running' ORDER BY rowid")]
+
+    def incomplete_rejections(self) -> list[dict]:
+        with self.lock:
+            return [dict(row) for row in self.connection.execute(
+                "SELECT * FROM requests INDEXED BY requests_incomplete_rejections "
+                "WHERE state='rejected' AND accepted=0 AND result_json IS NULL")]
+
+    def blocked_workspaces(self) -> list[str]:
+        with self.lock:
+            return [row[0] for row in self.connection.execute(
+                "SELECT sessions.workspace FROM requests JOIN sessions USING(session_id) "
+                "WHERE requests.state IN ('running','unknown')")]
+
+    def has_live_requests(self) -> bool:
+        with self.lock:
+            return self.connection.execute(
+                "SELECT 1 FROM requests WHERE state IN ('queued','running') LIMIT 1"
+            ).fetchone() is not None
+
+    def dormant_candidates(self, cutoff: float) -> list[str]:
+        with self.lock:
+            return [row[0] for row in self.connection.execute(
+                "SELECT session_id FROM sessions WHERE state='idle' AND closed=0 AND last_activity<=?",
+                (cutoff,),
+            )]
 
     def pending(self) -> list[dict]:
         with self.lock:

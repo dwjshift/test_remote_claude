@@ -49,6 +49,7 @@ def workspaces_overlap(first: str | Path, second: str | Path) -> bool:
 def validate_config(config: dict) -> dict:
     selected = dict(config)
     defaults = {"branch": "mailbox", "max_workers": 10, "poll_interval": 60,
+                "adaptive_polling": True, "active_poll_interval": 10, "warm_poll_interval": 30,
                 "heartbeat_interval": 300, "idle_ttl_seconds": 86400,
                 "image_budget_bytes": 500 * 1024 * 1024, "claude_executable": "claude",
                 "claude_version": "2.1.300", "retry_interval": 1}
@@ -60,10 +61,16 @@ def validate_config(config: dict) -> dict:
     for name in ("max_workers", "image_budget_bytes"):
         if type(selected[name]) is not int or selected[name] < (1 if name == "max_workers" else 0):
             raise EngineError(f"Invalid {name}")
-    for name in ("poll_interval", "heartbeat_interval", "idle_ttl_seconds", "retry_interval"):
+    if type(selected["adaptive_polling"]) is not bool:
+        raise EngineError("adaptive_polling must be a boolean")
+    for name in ("poll_interval", "active_poll_interval", "warm_poll_interval",
+                 "heartbeat_interval", "idle_ttl_seconds", "retry_interval"):
         value = selected[name]
         if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
             raise EngineError(f"{name} must be a nonnegative finite number")
+    if selected["adaptive_polling"] and any(selected[name] <= 0 for name in (
+            "poll_interval", "active_poll_interval", "warm_poll_interval")):
+        raise EngineError("Adaptive polling intervals must be positive")
     if selected.get("max_budget_usd") is not None:
         value = selected["max_budget_usd"]
         if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
@@ -91,6 +98,12 @@ class Engine:
         self._started = False
         self._stopping = False
         self._scanned_head = None
+        self._schedule_dirty = True
+        # A restart may follow a partial batch. Read its controls before any
+        # durable queued request can execute, including during fetch outages.
+        self._ingest_pending = True
+        self._next_idle_sweep = 0.0
+        self._last_interaction_monotonic = None
         self._next_sync = self._next_publish = 0.0
         self._sync_failures = self._publish_failures = 0
         self._heartbeat = time.monotonic()
@@ -128,6 +141,10 @@ class Engine:
                 if (self.mailbox.path / "_server" / "status.json").exists() or list(self.mailbox.path.glob("sessions/*/responses/*/result.json")):
                     raise EngineError("Mailbox already has execution history; restore its original server state or use a fresh branch")
                 self.store.set_meta("mailbox", identity)
+            self._scanned_head = self.store.get_meta("ingested_head")
+            last_interaction = self.store.get_meta("last_interaction_time")
+            if last_interaction is not None:
+                self._last_interaction_monotonic = time.monotonic() - max(0, time.time() - last_interaction)
             self._recover_startup()
             self._executor = ThreadPoolExecutor(max_workers=self.config["max_workers"], thread_name_prefix="claude")
             self._started = True
@@ -149,14 +166,44 @@ class Engine:
             return False
 
     def _recover_startup(self) -> None:
-        for request in self.store.list_requests():
-            if request["state"] == "running":
-                initialized = int(self._initialized_on_disk(request))
-                with self.store.transaction() as db:
-                    db.execute("UPDATE requests SET state='unknown' WHERE request_id=?", (request["request_id"],))
-                    db.execute("UPDATE sessions SET state='unknown', initialized=MAX(initialized,?), error=? WHERE session_id=?",
-                               (initialized, "Execution was interrupted; explicit recovery is required", request["session_id"]))
-                    self._queue_snapshot(db, request["session_id"], "execution_unknown")
+        for request in self.store.running_requests():
+            initialized = int(self._initialized_on_disk(request))
+            with self.store.transaction() as db:
+                db.execute("UPDATE requests SET state='unknown' WHERE request_id=?", (request["request_id"],))
+                db.execute("UPDATE sessions SET state='unknown', initialized=MAX(initialized,?), error=? WHERE session_id=?",
+                           (initialized, "Execution was interrupted; explicit recovery is required", request["session_id"]))
+                self._queue_snapshot(db, request["session_id"], "execution_unknown")
+        for request in self.store.incomplete_rejections():
+            self._finalize_rejection(request)
+
+    def _finalize_rejection(self, request: dict) -> None:
+        self._finalize(request["request_id"], RunOutcome(
+            "rejected", "", request.get("rejection_error") or "Request was rejected before execution",
+            {}, False, None, None,
+        ))
+
+    def _mark_interaction(self, db, session_id: str) -> None:
+        now = time.time()
+        db.execute("INSERT INTO metadata(key,value) VALUES ('last_interaction_time',?) "
+                   "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (json.dumps(now),))
+        db.execute("UPDATE sessions SET last_activity=? WHERE session_id=?", (now, session_id))
+        self._last_interaction_monotonic = time.monotonic()
+        self._schedule_dirty = True
+        if self.config["adaptive_polling"] and not self._sync_failures:
+            self._next_sync = min(self._next_sync, self._last_interaction_monotonic + min(
+                self.config["poll_interval"], self.config["active_poll_interval"]))
+
+    def _poll_interval(self) -> float:
+        base = self.config["poll_interval"]
+        if not self.config["adaptive_polling"]:
+            return base
+        age = (float("inf") if self._last_interaction_monotonic is None
+               else time.monotonic() - self._last_interaction_monotonic)
+        if self.workers or self.store.has_live_requests() or age < 300:
+            return min(base, self.config["active_poll_interval"])
+        if age < 600:
+            return min(base, self.config["warm_poll_interval"])
+        return base
 
     def _snapshot(self, session: dict, **overrides) -> dict:
         return {"schema_version": 1, "session_id": session["session_id"],
@@ -200,23 +247,50 @@ class Engine:
         return value
 
     def _discover(self) -> None:
+        """Ingest only changed inputs, falling back safely for unavailable history."""
         sessions_dir = self.mailbox.path / "sessions"
         if not sessions_dir.exists():
             return
         if sessions_dir.is_symlink():
             raise ProtocolError("The sessions directory cannot be a symbolic link")
-        directories = sorted(sessions_dir.iterdir())
-        for directory in directories:
+        paths = self.mailbox.changed_paths(self._scanned_head, self.mailbox.head)
+        settings_paths, request_paths, control_paths = set(), set(), set()
+        if paths is None:
+            paths = [str(path.relative_to(self.mailbox.path)) for pattern in (
+                "*/settings.json", "*/requests/*.json", "*/controls/*.json")
+                for path in sessions_dir.glob(pattern)]
+        for relative in paths:
+            parts = Path(relative).parts
+            if len(parts) not in {3, 4} or parts[0] != "sessions":
+                continue
             try:
-                sid = validate_id(directory.name)
-                if directory.is_symlink() or not directory.is_dir():
-                    continue
-                settings = self._read_json(directory / "settings.json")
+                validate_id(parts[1])
+            except ValueError:
+                continue
+            path = self.mailbox.path / relative
+            if not path.is_file():
+                # Deletions do not modify the ledger or replay historical work.
+                continue
+            if len(parts) == 3 and parts[2] == "settings.json":
+                settings_paths.add(path)
+            elif len(parts) == 4 and parts[3].endswith(".json"):
+                if parts[2] == "requests":
+                    request_paths.add(path)
+                elif parts[2] == "controls":
+                    control_paths.add(path)
+        for path in sorted(settings_paths):
+            sid = path.parent.name
+            try:
+                settings = self._read_json(path)
                 existing = self.store.get_session(sid)
                 digest = content_hash(settings)
                 if existing:
                     if existing["settings_hash"] != digest:
                         LOGGER.error("Ignoring changed immutable settings for session %s", sid)
+                    # Registration may have committed before a failed scan's
+                    # late-input backfill. Replaying settings must backfill too.
+                    request_paths.update((path.parent / "requests").glob("*.json"))
+                    control_paths.update((path.parent / "controls").glob("*.json"))
                     continue
                 error = None
                 workspace = ""
@@ -234,18 +308,20 @@ class Engine:
                                (sid, canonical_json(settings).decode(), digest, workspace, str(uuid4()),
                                 "invalid" if error else "idle", time.time(), utc_now(), error))
                     self._queue_snapshot(db, sid, "session_created")
-            except (OSError, ValueError) as exc:
-                LOGGER.warning("Ignoring invalid session path %s: %s", directory.name, exc)
-        # Discover requests before controls, but do not schedule them yet. This
-        # lets an immediate cancel stop a request first seen in the same poll.
-        for directory in directories:
-            session = self.store.get_session(directory.name)
-            if not session or directory.is_symlink():
-                continue
-            for path in sorted((directory / "requests").glob("*.json")):
-                self._ingest_request(path, session["session_id"])
-            for path in sorted((directory / "controls").glob("*.json")):
-                self._ingest_control(path, session["session_id"])
+                # A request can arrive before its settings. New registration
+                # revisits that session's inputs without scanning other sessions.
+                request_paths.update((path.parent / "requests").glob("*.json"))
+                control_paths.update((path.parent / "controls").glob("*.json"))
+                self._schedule_dirty = True
+            except ValueError as exc:
+                LOGGER.warning("Ignoring invalid session path %s: %s", sid, exc)
+        # All requests precede controls so cancellation in the same sync wins.
+        for paths_to_ingest, ingest in ((request_paths, self._ingest_request),
+                                       (control_paths, self._ingest_control)):
+            for path in sorted(paths_to_ingest):
+                sid = path.parent.parent.name
+                if self.store.get_session(sid):
+                    ingest(path, sid)
 
     def _ingest_request(self, path: Path, sid: str) -> None:
         try:
@@ -262,6 +338,8 @@ class Engine:
                             "kind": "immutable_request_conflict", "request_id": rid,
                             "session_id": sid, "created_at": utc_now(),
                             "error": "An existing request ID was reused with different content"})})
+                if not existing["accepted"] and existing["result_json"] is None:
+                    self._finalize_rejection(existing)
                 return
             session = self.store.get_session(sid)
             error = None
@@ -280,15 +358,16 @@ class Engine:
             except ValueError as exc:
                 error = str(exc)
             with self.store.transaction() as db:
-                db.execute("INSERT INTO requests(request_id,session_id,body_json,body_hash,state,accepted,received_at) VALUES (?,?,?,?,?,?,?)",
-                           (rid, sid, canonical_json(body).decode(), digest, "rejected" if error else "queued", int(error is None), utc_now()))
+                db.execute("INSERT INTO requests(request_id,session_id,body_json,body_hash,state,accepted,received_at,rejection_error) VALUES (?,?,?,?,?,?,?,?)",
+                           (rid, sid, canonical_json(body).decode(), digest, "rejected" if error else "queued", int(error is None), utc_now(), error))
+                self._mark_interaction(db, sid)
                 if error is None:
                     db.execute("UPDATE sessions SET active_request_id=?,state='queued',last_activity=?,error=NULL WHERE session_id=?",
                                (rid, time.time(), sid))
                     self._queue_snapshot(db, sid, "request_accepted")
             if error:
                 self._finalize(rid, RunOutcome("rejected", "", error, {}, False, None, None))
-        except (OSError, ValueError) as exc:
+        except ValueError as exc:
             LOGGER.warning("Ignoring invalid request %s: %s", path.name, exc)
 
     def _matching_session_worker_exists(self, request: dict) -> bool:
@@ -421,18 +500,17 @@ class Engine:
                 response.update(status="rejected", error=str(exc))
             with self.store.transaction() as db:
                 db.execute("INSERT INTO controls VALUES (?,?,?)", (cid, digest, canonical_json(response).decode()))
+                self._mark_interaction(db, sid)
                 Store.enqueue(db, f"control:{cid}", {f"sessions/{sid}/controls/results/{cid}.json": canonical_json(response)})
-        except (OSError, ValueError) as exc:
+        except ValueError as exc:
             LOGGER.warning("Ignoring invalid control %s: %s", path.name, exc)
 
     def _schedule(self) -> None:
-        blocked = [self.store.get_session(item["session_id"])["workspace"]
-                   for item in self.store.list_requests() if item["state"] in {"running", "unknown"}]
-        for request in self.store.list_requests():
+        self._schedule_dirty = False
+        blocked = self.store.blocked_workspaces()
+        for request in self.store.queued_requests():
             if len(self.workers) >= self.config["max_workers"]:
                 break
-            if request["state"] != "queued":
-                continue
             session = self.store.get_session(request["session_id"])
             workspace = session["workspace"]
             if any(workspaces_overlap(workspace, other) for other in blocked):
@@ -479,7 +557,9 @@ class Engine:
                     db.execute("UPDATE sessions SET state='unknown',error=? WHERE session_id=?",
                                ("Worker completion could not be persisted; explicit recovery is required", request["session_id"]))
                     self._queue_snapshot(db, request["session_id"], "execution_unknown")
+                    self._mark_interaction(db, request["session_id"])
             del self.workers[rid]
+            self._schedule_dirty = True
 
     def _finalize(self, rid: str, outcome: RunOutcome, *, recovery_control: tuple | None = None) -> None:
         request = self.store.get_request(rid)
@@ -492,6 +572,7 @@ class Engine:
                 db.execute("UPDATE sessions SET state='unknown',initialized=MAX(initialized,?),error=? WHERE session_id=?",
                            (int(outcome.session_initialized), outcome.error, session["session_id"]))
                 self._queue_snapshot(db, session["session_id"], "execution_unknown")
+                self._mark_interaction(db, session["session_id"])
             return
         accepted = bool(request["accepted"])
         revision = session["revision"] + int(accepted)
@@ -512,6 +593,7 @@ class Engine:
         files = {prefix + "result.json": canonical_json(result), prefix + "answer.md": bundle.answer.encode("utf-8")}
         files.update({prefix + name: data for name, data in bundle.files.items()})
         with self.store.transaction() as db:
+            self._mark_interaction(db, session["session_id"])
             db.execute("UPDATE requests SET state='publishing',result_json=?,ended_at=? WHERE request_id=?",
                        (canonical_json(result).decode(), result["ended_at"], rid))
             if accepted:
@@ -550,6 +632,8 @@ class Engine:
             validate_publication(files, self.config.get("artifact_limits"))
             self.mailbox.publish(files, "Publish remote Claude state and completed turns", mutable_paths=mutable)
             self.store.acknowledge(pending)
+            if any(row["terminal_state"] for row in pending):
+                self._schedule_dirty = True
             self._publish_failures = 0
         except Exception as exc:
             self._publish_failures += 1
@@ -568,20 +652,33 @@ class Engine:
                 self.mailbox.sync()
                 head = self.mailbox.head
                 if head != self._scanned_head:
+                    self._ingest_pending = True
                     self._discover()
+                # The original input may have been deleted after its rejection
+                # decision committed. Complete that durable decision even when
+                # there is no longer a changed file to replay.
+                for request in self.store.incomplete_rejections():
+                    self._finalize_rejection(request)
+                if head != self._scanned_head:
+                    # Only ingestion advances this cursor. Publisher fetches can
+                    # bring in unseen inputs and must never acknowledge them.
+                    self.store.set_meta("ingested_head", head)
                     self._scanned_head = head
+                self._ingest_pending = False
                 self._sync_failures = 0
-                self._next_sync = now + self.config["poll_interval"]
+                self._next_sync = time.monotonic() + self._poll_interval()
             except Exception as exc:
                 self._sync_failures += 1
-                self._next_sync = now + min(300, max(1, self.config["retry_interval"]) * 2 ** min(self._sync_failures - 1, 8))
+                self._next_sync = time.monotonic() + min(300, max(1, self.config["retry_interval"]) * 2 ** min(self._sync_failures - 1, 8))
                 LOGGER.warning("Mailbox synchronization deferred: %s", exc)
-        self._schedule()
-        for session in self.store.list_sessions():
-            if session["state"] == "idle" and not session["closed"] and time.time() - session["last_activity"] >= self.config["idle_ttl_seconds"]:
+        if self._schedule_dirty and not self._ingest_pending:
+            self._schedule()
+        if now >= self._next_idle_sweep:
+            for sid in self.store.dormant_candidates(time.time() - self.config["idle_ttl_seconds"]):
                 with self.store.transaction() as db:
-                    db.execute("UPDATE sessions SET state='dormant' WHERE session_id=?", (session["session_id"],))
-                    self._queue_snapshot(db, session["session_id"], "session_dormant")
+                    db.execute("UPDATE sessions SET state='dormant' WHERE session_id=?", (sid,))
+                    self._queue_snapshot(db, sid, "session_dormant")
+            self._next_idle_sweep = time.monotonic() + 60
         if now - self._heartbeat >= self.config["heartbeat_interval"]:
             self._queue_heartbeat()
         self._publish()

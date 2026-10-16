@@ -163,7 +163,7 @@ def test_cli_roundtrip_with_real_engine_and_fake_claude(
     assert (session_directory / "requests" / f"{created['request_id']}.json").is_file()
     config = {
         "remote": str(remote), "state_dir": str(tmp_path / "server-state"),
-        "claude_executable": str(fake_claude), "poll_interval": 0,
+        "claude_executable": str(fake_claude), "poll_interval": 0, "adaptive_polling": False,
         "heartbeat_interval": 3600,
     }
     with Engine(config) as engine:

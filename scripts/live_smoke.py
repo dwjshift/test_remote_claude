@@ -211,7 +211,8 @@ def run(arguments, directory: Path, report: dict) -> None:
 
     server_config = {"remote": remote, "branch": branch, "state_dir": str(directory / "server-state"),
                      "claude_executable": executable, "claude_version": "2.1.300",
-                     "poll_interval": 5 if arguments.remote else 0.2, "heartbeat_interval": 600,
+                     "poll_interval": 5 if arguments.remote else 0.2, "adaptive_polling": False,
+                     "heartbeat_interval": 600,
                      "max_workers": 1, "max_budget_usd": arguments.budget}
     save_json(directory / "server.json", server_config)
     with Engine(server_config, runner=observed_runner) as engine:
