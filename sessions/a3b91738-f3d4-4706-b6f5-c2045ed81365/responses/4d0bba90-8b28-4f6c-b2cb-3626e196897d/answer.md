@@ -1,0 +1,1 @@
+当前会话使用的模型是 Claude Sonnet 5（模型 ID：claude-sonnet-5），知识截止日期为 2026 年 1 月。
