@@ -2,7 +2,7 @@
 
 This is an execution runbook for the agent running **on the target EC2 instance**. Complete the setup, make and push necessary compatibility fixes, test both sides on EC2 through temporary GitHub branches, update `USAGE.md` with verified machine/model information, and leave the production server running.
 
-The instance is expected to have a working Claude Code installation using Amazon Bedrock. Preserve that provider and credential setup. This document does **not** establish that EC2 deployment or any particular Bedrock model has already been verified. Repository behavior was reviewed at `a898e6d`; official references were checked on October 15, 2026, America/Los_Angeles. Recheck the installed CLI and current documentation when executing this runbook.
+The instance is expected to have a working Claude Code installation using Amazon Bedrock. Preserve that provider and credential setup. This document does **not** establish that EC2 deployment or any particular Bedrock model has already been verified. Record the source commit tested on EC2; official references were checked on October 15, 2026, America/Los_Angeles. Recheck the installed CLI and current documentation when executing this runbook.
 
 ## 1. Required outcome and operating rules
 
@@ -248,7 +248,7 @@ config.update(remote=os.environ["RC_REMOTE"], branch=os.environ["RC_TEST_BRANCH"
               state_dir=str(directory / "server-state"),
               claude_executable=os.environ["RC_CLAUDE"],
               claude_version=os.environ["RC_CLAUDE_VERSION"],
-              max_workers=2, max_budget_usd=1)
+              max_workers=2, workspace_policy="shared", max_budget_usd=1)
 (directory / "server.json").write_text(json.dumps(config, indent=2) + "\n")
 PY
 .venv/bin/remote-claude-server --config "$RC_TEST_DIR/server.json" doctor \
@@ -417,7 +417,8 @@ config.update(remote=os.environ["RC_REMOTE"], branch=os.environ["RC_PROD_BRANCH"
               claude_version=os.environ["RC_CLAUDE_VERSION"],
               adaptive_polling=True, poll_interval=60,
               active_poll_interval=10, warm_poll_interval=30,
-              max_workers=10, heartbeat_interval=300, idle_ttl_seconds=86400)
+              max_workers=10, workspace_policy="shared",
+              heartbeat_interval=300, idle_ttl_seconds=86400)
 path.write_text(json.dumps(config, indent=2) + "\n")
 path.chmod(0o600)
 PY
@@ -433,7 +434,8 @@ Production parameters must be recorded explicitly in `USAGE.md`:
 | Activity windows | Queued/running work or interaction in the last 5 minutes: 10 seconds; 5–10 minutes: 30 seconds; older: 60 seconds |
 | Timing | Initial sync immediately; normally wait from completion of the preceding sync; Git work can delay the next sync; activity can shorten the wait; errors use backoff |
 | Scope | One central poller, no per-session GitHub polling; completed results enter publication immediately |
-| Concurrency | `max_workers=10`; excess work queues; equal/parent/child workspaces remain mutually exclusive |
+| Concurrency | `max_workers=10`; excess work queues; each session accepts at most one unfinished request |
+| Workspace policy | `workspace_policy="shared"`; different sessions may run concurrently in equal or parent/child workspaces; `exclusive` opts into serialization |
 | Heartbeat / idle sessions | `heartbeat_interval=300`; `idle_ttl_seconds=86400`; dormant sessions retain history |
 | Network retries | `retry_interval=1`, exponential backoff up to 300 seconds; `git_timeout=30` unless measured network conditions require adjustment |
 | Session defaults | Verified model mapping, effort `high` only if verified, default turn timeout 3600 seconds; explicitly supplied through `client new` |
@@ -443,6 +445,10 @@ Production parameters must be recorded explicitly in `USAGE.md`:
 
 If instance capacity or Bedrock quotas require lowering concurrency, document the tested value and reason. Keep the agreed polling schedule. Production configuration deliberately does not inherit the smoke's USD 1 budget cap; choose and document a production cap only when desired. Large data stays on the server. Workspaces must already exist under the service account's real home and must not contain or sit inside the server state directory.
 
+Shared workspaces use the same original files, so coordinate sessions that edit the same files or Git index. Under either workspace policy, an `unknown` execution blocks new overlapping work until explicit recovery; it does not automatically cancel other turns that are already running.
+
+Existing configurations without `workspace_policy` adopt `shared` after restart, without a database or mailbox protocol migration. Set `"workspace_policy": "exclusive"` explicitly to retain the previous equal/nested workspace serialization. Record any intentional departure from the shared production default.
+
 ## 10. Update USAGE.md with verified EC2 facts and models
 
 Add a clearly labeled **Verified EC2 Deployment** section. Do not replace local-machine facts with guesses. Include the following concrete values; use no `REPLACE_...` placeholders in a completed deployment record:
@@ -451,7 +457,7 @@ Add a clearly labeled **Verified EC2 Deployment** section. Do not replace local-
 - Actual remote, production mailbox branch, checkout path, pinned executable, configuration/environment file paths, persistent state path, and native history location. Never include credential values.
 - Bedrock region, credential **method** and unattended refresh requirements, model alias mappings needed by clients, and provider tool restrictions.
 - A model table with exact client `--model` strings, actual model/profile identity or a documented local alias mapping, tested effort values, auto/tool/resume results, verification date, and limitations. Distinguish unverified inventory entries from supported choices.
-- Polling/concurrency/timeout/attachment values from section 9, actual unit name, service manager type, startup policy, stop/restart/status/log commands, and recovery procedure.
+- Polling/concurrency/workspace-policy/timeout/attachment values from section 9, actual unit name, service manager type, startup policy, stop/restart/status/log commands, and recovery procedure.
 - Offline and real Bedrock/GitHub test outcomes, local evidence paths, and deleted test branch names. Do not commit the raw reports.
 - A ready-to-copy client initialization and `new` example using an actual existing server `~/...` workspace and a verified model value. Only the server needs AWS credentials; clients need repository access.
 
@@ -515,7 +521,7 @@ Return the pushed commit IDs and confirm all of the following with actual eviden
 - Offline tests and the temporary GitHub smoke/daemon checks passed, or any unresolved failure is explicitly identified.
 - Every successful test branch was deleted; any retained failed branch has a specific reason and cleanup command.
 - Production is running under the recorded account/unit, owns the intended mailbox, and has published a fresh heartbeat.
-- The actual production config uses the agreed 60/30/10-second adaptive policy and the documented concurrency.
+- The actual production config uses the agreed 60/30/10-second adaptive policy, documented concurrency, and explicit `workspace_policy="shared"` unless a different policy was intentionally recorded.
 - Source and English operating documentation are pushed to `main`; credentials and generated data remain local and ignored.
 
 If a required gate cannot be satisfied, leave the working Bedrock installation intact, retain local diagnostics, and identify the exact blocker and next action. Do not label an interactive-only configuration or an untested model as a completed unattended deployment.

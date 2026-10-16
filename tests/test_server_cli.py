@@ -15,7 +15,7 @@ from client.cli import main as client_main
 from common.config import load_config, save_config
 from common.git_transport import GitMailbox
 from server.__main__ import authentication, pinned_executable
-from server.engine import validate_config
+from server.engine import EngineError, validate_config
 
 
 def test_unauthenticated_server_stops_before_consuming_mailbox(tmp_path, fake_claude, monkeypatch, capsys):
@@ -77,6 +77,26 @@ def test_documented_config_examples_are_valid_and_keep_separate_state():
     assert client["branch"] == server["branch"] == "mailbox"
     assert server["claude_version"] == "2.1.300"
     assert server["artifact_limits"]["text_limit"] == 256 * 1024
+    assert server["workspace_policy"] == "shared"
+
+
+def test_workspace_policy_defaults_to_shared_for_existing_configs():
+    config = {"remote": "example.git", "state_dir": "server-state"}
+    assert validate_config(config)["workspace_policy"] == "shared"
+    assert "workspace_policy" not in config
+
+
+@pytest.mark.parametrize("policy", ["shared", "exclusive"])
+def test_workspace_policy_accepts_documented_values(policy):
+    config = {"remote": "example.git", "state_dir": "server-state", "workspace_policy": policy}
+    assert validate_config(config)["workspace_policy"] == policy
+
+
+@pytest.mark.parametrize("policy", [None, True, False, 0, "", "Shared", "parallel", [], {}])
+def test_workspace_policy_rejects_invalid_values(policy):
+    config = {"remote": "example.git", "state_dir": "server-state", "workspace_policy": policy}
+    with pytest.raises(EngineError, match="workspace_policy"):
+        validate_config(config)
 
 
 def test_server_cli_sigterm_cancels_worker_and_publishes_result(

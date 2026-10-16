@@ -57,16 +57,18 @@ def test_hot_queries_use_indexes_and_ignore_completed_rows(tmp_path):
             ("SELECT * FROM requests WHERE state='queued' ORDER BY rowid", "requests_state"),
             ("SELECT * FROM requests WHERE state='running' ORDER BY rowid", "requests_state"),
             ("SELECT sessions.workspace FROM requests JOIN sessions USING(session_id) WHERE requests.state IN ('running','unknown')", "requests_state"),
+            ("SELECT sessions.workspace FROM requests JOIN sessions USING(session_id) WHERE requests.state='unknown'", "requests_state"),
         ):
             explanation = " ".join(str(tuple(row)) for row in store.connection.execute("EXPLAIN QUERY PLAN " + query))
             assert index in explanation
         with store.transaction() as db:
-            db.execute("INSERT INTO sessions(session_id,settings_json,settings_hash,workspace,claude_session_id,last_activity,created_at) VALUES ('s','{}','h','/home/test','native',0,'now')")
             for state in ("queued", "running", "unknown", "completed"):
-                db.execute("INSERT INTO requests(request_id,session_id,body_json,body_hash,state,accepted,received_at) VALUES (?,'s','{}','h',?,1,'now')", (state, state))
+                db.execute("INSERT INTO sessions(session_id,settings_json,settings_hash,workspace,claude_session_id,last_activity,created_at) VALUES (?,'{}','h',?,?,0,'now')", (state, f"/home/test/{state}", f"native-{state}"))
+                db.execute("INSERT INTO requests(request_id,session_id,body_json,body_hash,state,accepted,received_at) VALUES (?,?,'{}','h',?,1,'now')", (state, state, state))
         assert [row["request_id"] for row in store.queued_requests()] == ["queued"]
         assert [row["request_id"] for row in store.running_requests()] == ["running"]
-        assert store.blocked_workspaces() == ["/home/test", "/home/test"]
+        assert sorted(store.blocked_workspaces()) == ["/home/test/running", "/home/test/unknown"]
+        assert store.blocked_workspaces(include_running=False) == ["/home/test/unknown"]
         assert store.has_live_requests()
     finally:
         store.close()

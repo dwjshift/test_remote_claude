@@ -411,22 +411,146 @@ def test_cancel_received_with_initial_request_prevents_execution(harness):
     assert not harness.invocations()
 
 
-def test_overlapping_workspaces_are_serialized(harness):
+@pytest.mark.parametrize("relation", ["same", "child", "parent"])
+@pytest.mark.parametrize("same_batch", [False, True])
+def test_shared_workspaces_execute_concurrently_by_default(harness, relation, same_batch):
     child = harness.workspace / "nested"
     child.mkdir()
-    first_session, first_id = harness.submit(json.dumps({"fake": "hang"}))
+    first_workspace = child if relation == "parent" else harness.workspace
+    second_workspace = child if relation == "child" else harness.workspace
+    first = harness.submit(json.dumps({"fake": "hang"}), workspace=first_workspace)
+    if not same_batch:
+        harness.wait_until(lambda: bool(harness.invocations()))
+    second = harness.submit(json.dumps({"fake": "hang"}), workspace=second_workspace)
+    harness.wait_until(lambda: len(harness.invocations()) == 2)
+
+    records = harness.invocations()
+    assert {record["cwd"] for record in records} == {
+        str(first_workspace), str(second_workspace),
+    }
+    assert len({record["session_id"] for record in records}) == 2
+    for record in records:
+        os.kill(record["pid"], 0)
+    if same_batch and relation == "same":
+        # Resume requires durable initialization, not just a launched process.
+        harness.wait_until(lambda: all(
+            harness.engine._initialized_on_disk(harness.engine.store.get_request(request_id))
+            for _, request_id in (first, second)
+        ))
+    for session_id, request_id in (first, second):
+        assert harness.engine.store.get_request(request_id)["state"] == "running"
+        assert harness.engine.store.get_session(session_id)["revision"] == 0
+        harness.control(session_id, "cancel", request_id=request_id)
+    for session_id, request_id in (first, second):
+        result = harness.result(session_id, request_id)
+        assert result["status"] == "cancelled"
+        assert result["revision"] == 1
+
+    if same_batch and relation == "same":
+        native_sessions = {
+            session_id: harness.engine.store.get_session(session_id)["claude_session_id"]
+            for session_id, _ in (first, second)
+        }
+        followups = [
+            (session_id, harness.send(session_id, "Resume this session only.", revision=1))
+            for session_id in native_sessions
+        ]
+        for session_id, request_id in followups:
+            result = harness.result(session_id, request_id)
+            assert result["status"] == "completed"
+            assert result["revision"] == 2
+            assert result["claude_session_id"] == native_sessions[session_id]
+        resumed = harness.invocations()[2:]
+        assert len(resumed) == 2
+        assert all(record["resume"] for record in resumed)
+        assert {record["session_id"] for record in resumed} == set(native_sessions.values())
+
+
+@pytest.mark.parametrize("relation", ["same", "child", "parent"])
+def test_exclusive_workspaces_serialize_overlapping_requests(harness, relation):
+    harness.engine.config["workspace_policy"] = "exclusive"
+    child = harness.workspace / "nested"
+    child.mkdir()
+    first_workspace = child if relation == "parent" else harness.workspace
+    second_workspace = child if relation == "child" else harness.workspace
+    first_session, first_id = harness.submit(
+        json.dumps({"fake": "hang"}), workspace=first_workspace,
+    )
     harness.wait_until(lambda: bool(harness.invocations()))
-    second_session, second_id = harness.submit(workspace=child)
+    second_session, second_id = harness.submit(workspace=second_workspace)
     for _ in range(3):
         harness.engine.tick()
     assert len(harness.invocations()) == 1
+    assert harness.engine.store.get_request(second_id)["state"] == "queued"
     harness.control(first_session, "cancel", request_id=first_id)
     assert harness.result(first_session, first_id)["status"] == "cancelled"
     assert harness.result(second_session, second_id)["status"] == "completed"
     assert len(harness.invocations()) == 2
 
 
+@pytest.mark.parametrize("policy", ["shared", "exclusive"])
+@pytest.mark.parametrize("relation", ["same", "child", "parent"])
+def test_unknown_workspace_blocks_overlapping_requests_until_recovery(harness, policy, relation):
+    harness.engine.config["workspace_policy"] = policy
+    parent = harness.workspace / "project"
+    child = parent / "nested"
+    child.mkdir(parents=True)
+    unrelated = harness.workspace / "unrelated"
+    unrelated.mkdir()
+    first_workspace = child if relation == "parent" else parent
+    second_workspace = child if relation == "child" else parent
+    first_session, first_id = harness.submit(
+        json.dumps({"fake": "malformed"}), workspace=first_workspace,
+    )
+    harness.wait_until(
+        lambda: harness.engine.store.get_request(first_id)
+        and harness.engine.store.get_request(first_id)["state"] == "unknown"
+    )
+    second_session, second_id = harness.submit(workspace=second_workspace)
+    unrelated_session, unrelated_id = harness.submit(workspace=unrelated)
+    assert harness.result(unrelated_session, unrelated_id)["status"] == "completed"
+    assert harness.engine.store.get_request(second_id)["state"] == "queued"
+    assert harness.engine.store.get_session(first_session)["revision"] == 0
+    assert len(harness.invocations()) == 2
+
+    control_id = harness.control(first_session, "recover", acknowledge=True)
+    assert harness.control_result(first_session, control_id)["status"] == "recovered"
+    interrupted = harness.result(first_session, first_id)
+    assert interrupted["status"] == "interrupted"
+    assert interrupted["revision"] == 1
+    completed = harness.result(second_session, second_id)
+    assert completed["status"] == "completed"
+    assert completed["revision"] == 1
+    assert len(harness.invocations()) == 3
+
+
+def test_shared_unknown_blocks_new_work_without_cancelling_running_peer(harness):
+    running_session, running_id = harness.submit(json.dumps({"fake": "hang"}))
+    harness.wait_until(lambda: bool(harness.invocations()))
+    unknown_session, unknown_id = harness.submit(json.dumps({"fake": "malformed"}))
+    harness.wait_until(
+        lambda: harness.engine.store.get_request(unknown_id)
+        and harness.engine.store.get_request(unknown_id)["state"] == "unknown"
+    )
+    queued_session, queued_id = harness.submit()
+    for _ in range(3):
+        harness.engine.tick()
+    assert harness.engine.store.get_request(queued_id)["state"] == "queued"
+    assert harness.engine.store.get_request(running_id)["state"] == "running"
+    assert len(harness.invocations()) == 2
+    os.kill(harness.invocations()[0]["pid"], 0)
+
+    harness.control(unknown_session, "recover", acknowledge=True)
+    assert harness.result(unknown_session, unknown_id)["status"] == "interrupted"
+    assert harness.result(queued_session, queued_id)["status"] == "completed"
+    assert harness.engine.store.get_request(running_id)["state"] == "running"
+    harness.control(running_session, "cancel", request_id=running_id)
+    assert harness.result(running_session, running_id)["status"] == "cancelled"
+    assert len(harness.invocations()) == 3
+
+
 def test_cancel_queued_request_does_not_spawn_a_worker(harness):
+    harness.engine.config["max_workers"] = 1
     first_session, first_id = harness.submit(json.dumps({"fake": "hang"}))
     harness.wait_until(lambda: bool(harness.invocations()))
     second_session, second_id = harness.submit()
@@ -438,11 +562,14 @@ def test_cancel_queued_request_does_not_spawn_a_worker(harness):
     assert harness.result(first_session, first_id)["status"] == "cancelled"
 
 
-def test_worker_limit_queues_independent_workspaces(harness):
+@pytest.mark.parametrize("shared_workspace", [False, True])
+def test_worker_limit_queues_requests_with_any_workspace(harness, shared_workspace):
     sessions = []
     for index in range(3):
-        directory = harness.workspace / f"project-{index}"
-        directory.mkdir()
+        directory = harness.workspace
+        if not shared_workspace:
+            directory = harness.workspace / f"project-{index}"
+            directory.mkdir()
         sessions.append(
             harness.submit(json.dumps({"fake": "hang"}), workspace=directory)
         )
@@ -451,6 +578,7 @@ def test_worker_limit_queues_independent_workspaces(harness):
     for _ in range(3):
         harness.engine.tick()
     assert len(harness.invocations()) == 2
+    assert harness.engine.store.get_request(sessions[2][1])["state"] == "queued"
     first_session, first_id = sessions[0]
     harness.control(first_session, "cancel", request_id=first_id)
     assert harness.result(first_session, first_id)["status"] == "cancelled"

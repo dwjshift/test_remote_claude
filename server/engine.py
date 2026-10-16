@@ -48,7 +48,7 @@ def workspaces_overlap(first: str | Path, second: str | Path) -> bool:
 
 def validate_config(config: dict) -> dict:
     selected = dict(config)
-    defaults = {"branch": "mailbox", "max_workers": 10, "poll_interval": 60,
+    defaults = {"branch": "mailbox", "max_workers": 10, "workspace_policy": "shared", "poll_interval": 60,
                 "adaptive_polling": True, "active_poll_interval": 10, "warm_poll_interval": 30,
                 "heartbeat_interval": 300, "idle_ttl_seconds": 86400,
                 "image_budget_bytes": 500 * 1024 * 1024, "claude_executable": "claude",
@@ -61,6 +61,8 @@ def validate_config(config: dict) -> dict:
     for name in ("max_workers", "image_budget_bytes"):
         if type(selected[name]) is not int or selected[name] < (1 if name == "max_workers" else 0):
             raise EngineError(f"Invalid {name}")
+    if selected["workspace_policy"] not in ("shared", "exclusive"):
+        raise EngineError("workspace_policy must be shared or exclusive")
     if type(selected["adaptive_polling"]) is not bool:
         raise EngineError("adaptive_polling must be a boolean")
     for name in ("poll_interval", "active_poll_interval", "warm_poll_interval",
@@ -507,7 +509,9 @@ class Engine:
 
     def _schedule(self) -> None:
         self._schedule_dirty = False
-        blocked = self.store.blocked_workspaces()
+        exclusive = self.config["workspace_policy"] == "exclusive"
+        # Interrupted work freezes overlapping directories under either policy.
+        blocked = self.store.blocked_workspaces(include_running=exclusive)
         for request in self.store.queued_requests():
             if len(self.workers) >= self.config["max_workers"]:
                 break
@@ -540,7 +544,8 @@ class Engine:
                                (pid, process_start, self.boot_id, request_id))
 
             self.workers[rid] = (self._executor.submit(self.runner, spec, event, started), event)
-            blocked.append(workspace)
+            if exclusive:
+                blocked.append(workspace)
 
     def _finish_workers(self) -> None:
         for rid, (future, _) in list(self.workers.items()):

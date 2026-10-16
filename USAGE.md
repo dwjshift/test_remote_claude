@@ -77,6 +77,7 @@ Run **exactly one server with one persistent state directory per mailbox branch*
 | `claude_executable` | `claude` | Executable path; the example pins the native 2.1.300 file |
 | `claude_version` | `2.1.300` | Required version, checked with required CLI flags |
 | `max_workers` | `10` | Maximum concurrent turns; excess work waits |
+| `workspace_policy` | `shared` | Allow different sessions to run concurrently in equal or nested workspaces; `exclusive` serializes overlapping workspaces |
 | `poll_interval` | `60` | Idle polling interval and upper bound for adaptive intervals; fixed interval when adaptation is disabled |
 | `adaptive_polling` | `true` | Adjust the central polling interval according to activity |
 | `active_poll_interval` | `10` | Polling interval while work is queued/running or interaction occurred less than five minutes ago |
@@ -90,6 +91,8 @@ Run **exactly one server with one persistent state directory per mailbox branch*
 | `artifact_limits` | See below | Per-turn export limits |
 
 Model, effort, workspace, and turn timeout are immutable **session** settings supplied by `client new`, not server defaults. Change those settings by creating another session. Restart the server to apply changes to server configuration.
+
+When upgrading, configurations without `workspace_policy` use `shared` after the server restarts. Set `"workspace_policy": "exclusive"` explicitly before restarting to keep the previous serialization behavior. This setting requires no database or mailbox protocol migration.
 
 ### Preflight, Start, and Stop
 
@@ -118,7 +121,11 @@ Create the intended project directory on the **server** first. For example, `--w
 
 The path must resolve to an existing directory inside the server account's home. Paths using `..` or symlinks are rejected if their resolved destination escapes home; symlinks to directories within home are allowed. The server records the resolved absolute path and checks it again before later turns. A workspace cannot contain, or be inside, the server state directory.
 
-This is the actual subprocess `cwd`: Claude operates on the original project files. It is not a copy, a temporary sandbox, or a separate filesystem. The home check constrains the starting directory, not every file a tool can access. Workspaces that are equal or nested cannot execute simultaneously. Independent workspaces can run in parallel.
+This is the actual subprocess `cwd`: Claude operates on the original project files. It is not a copy, a temporary sandbox, or a separate filesystem. The home check constrains the starting directory, not every file a tool can access.
+
+The default `workspace_policy="shared"` allows different sessions to run simultaneously in the same directory or in parent/child directories, subject to the global `max_workers` limit. For example, sessions using `~/project` and `~/project/frontend` may execute together. Coordinate tasks that edit the same files or Git index, as when running multiple local Claude sessions. Each session still accepts at most one unfinished request.
+
+Set `workspace_policy="exclusive"` in the server configuration to serialize equal and parent/child workspaces. Sibling directories such as `~/project/frontend` and `~/project/backend` may still run concurrently. Both policies block new turns that overlap an `unknown` execution until it is explicitly recovered; other turns already running are not cancelled solely because an execution becomes `unknown`.
 
 Each prompt starts a fresh CLI process. The first turn uses a persisted Claude session UUID; subsequent turns explicitly use `--resume` with that UUID. Native Claude history supplies the context. No process remains alive merely to wait for another prompt. Dormancy preserves the session UUID, revision, and files.
 
@@ -149,7 +156,7 @@ Preserve project workspaces, the server state directory, and native Claude histo
 
 ### Interrupted Execution and Recovery
 
-After a crash during execution, the request becomes `unknown`. Its session and overlapping workspaces remain frozen, and the revision does not advance. The server does not automatically resend the old prompt.
+After a crash during execution, the request becomes `unknown`. Its session and new work in overlapping workspaces remain frozen under both workspace policies, and the revision does not advance. The server does not automatically resend the old prompt.
 
 1. Restart with the **same server configuration and state directory**.
 2. Inspect the published status, local logs, and actual workspace side effects.

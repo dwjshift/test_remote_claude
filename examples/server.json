@@ -5,6 +5,7 @@
   "claude_executable": "~/.local/share/claude/versions/2.1.300",
   "claude_version": "2.1.300",
   "max_workers": 10,
+  "workspace_policy": "shared",
   "poll_interval": 60,
   "adaptive_polling": true,
   "active_poll_interval": 10,

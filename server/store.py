@@ -138,11 +138,13 @@ class Store:
                 "SELECT * FROM requests INDEXED BY requests_incomplete_rejections "
                 "WHERE state='rejected' AND accepted=0 AND result_json IS NULL")]
 
-    def blocked_workspaces(self) -> list[str]:
+    def blocked_workspaces(self, *, include_running: bool = True) -> list[str]:
+        states = ("running", "unknown") if include_running else ("unknown",)
+        placeholders = ",".join("?" for _ in states)
         with self.lock:
             return [row[0] for row in self.connection.execute(
                 "SELECT sessions.workspace FROM requests JOIN sessions USING(session_id) "
-                "WHERE requests.state IN ('running','unknown')")]
+                f"WHERE requests.state IN ({placeholders})", states)]
 
     def has_live_requests(self) -> bool:
         with self.lock:
