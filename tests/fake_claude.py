@@ -110,6 +110,8 @@ def main() -> int:
         child = subprocess.Popen([sys.executable, "-c", "import time;time.sleep(120)"])
         if state_dir:
             (state_dir / "child.pid").write_text(str(child.pid))
+    for content in scenario.get("assistant_messages", []):
+        emit({"type": "assistant", "session_id": session_id, "message": {"content": content}})
     if scenario.get("image"):
         match = re.search(r"export directory: (.*?)\. Do not export", option("--append-system-prompt"))
         if match:

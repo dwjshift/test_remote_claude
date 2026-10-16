@@ -118,6 +118,22 @@ def test_inline_data_is_removed_without_downloading_links(tmp_path):
     assert bundle.files == {}
 
 
+@pytest.mark.parametrize("text_limit", [0, 512, 262144])
+def test_output_notice_precedes_long_answer_and_respects_text_limit(tmp_path, text_limit):
+    warnings = [{"code": "unsupported_content", "content_type": "image", "count": 1}]
+    bundle = collect_artifacts(tmp_path, "\u2713" * 100000, {"text_limit": text_limit},
+                               remaining_bytes=0, output_warnings=warnings)
+    assert len(bundle.answer.encode("utf-8")) <= text_limit
+    assert bundle.artifacts == []
+    if text_limit:
+        assert bundle.answer.startswith("> **Output notice:**")
+        assert "metadata.output_warnings" in bundle.answer
+        assert "Answer truncated" in bundle.answer
+        assert "\ufffd" not in bundle.answer
+    else:
+        assert bundle.answer == ""
+
+
 def test_export_directory_link_is_not_followed(tmp_path):
     actual = tmp_path / "actual"
     actual.mkdir()

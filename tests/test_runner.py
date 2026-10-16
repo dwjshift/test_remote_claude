@@ -62,6 +62,10 @@ def test_first_turn_and_resume_use_persistent_session_and_controlled_config(spec
     assert json.loads(args[args.index("--settings") + 1])["disableAllHooks"]
     assert "--strict-mcp-config" in args
     assert "--bare" not in args
+    instruction = args[args.index("--append-system-prompt") + 1]
+    assert "GitHub-flavored Markdown" in instruction
+    assert "PNG, JPEG or WebP" in instruction
+    assert str((spec.run_dir / "exports").resolve()) in instruction
     assert not records[0]["stdin_isatty"]
     assert not records[0]["stdout_isatty"]
     assert records[0]["disable_autoupdater"] == "1"
@@ -195,3 +199,138 @@ def test_long_errors_are_summarized_for_publication(spec):
     assert outcome.status == "failed"
     assert len(outcome.error.encode()) <= 4096
     assert len(json.dumps(outcome.metadata)) < 10000
+
+
+def test_mixed_assistant_content_preserves_markdown_and_reports_only_unsupported_blocks(spec):
+    payload = "private-unsupported-payload:" + "a" * 10000
+    answer = "# Result\n\n**Ready**: [reference](https://example.com/) \u2713\n"
+    content = [
+        {"type": "text", "text": "Intermediate text"},
+        {"type": "image", "source": {"type": "base64", "data": payload}},
+        {"type": "image", "source": {"url": payload}},
+        {"type": "audio", "data": payload},
+        {"type": "tool_use", "name": "Read", "input": {"file_path": payload}},
+        {"type": "server_tool_use", "name": "WebSearch", "input": {"query": payload}},
+        {"type": "tool_result", "content": payload},
+        {"type": "thinking", "thinking": payload},
+        {"type": "redacted_thinking", "data": payload},
+    ]
+    prompt = json.dumps({"assistant_messages": [content], "answer": answer})
+    outcome = run_claude(replace(spec, prompt=prompt), threading.Event())
+    assert outcome.status == "completed"
+    assert outcome.error is None
+    assert outcome.answer == answer
+    assert {item["content_type"]: item["count"] for item in outcome.metadata["output_warnings"]} == {
+        "image": 2, "audio": 1,
+    }
+    assert all(item["code"] == "unsupported_content" for item in outcome.metadata["output_warnings"])
+    assert payload not in json.dumps(outcome.metadata)
+    assert payload not in outcome.answer
+    records = (spec.workspace.parent / "fake-state" / "invocations.jsonl").read_text().splitlines()
+    assert len(records) == 1
+
+
+def test_nontext_only_assistant_content_finishes_with_warning_metadata(spec):
+    prompt = json.dumps({"assistant_messages": [[{"type": "image", "data": "hidden-image"}]],
+                         "answer": ""})
+    outcome = run_claude(replace(spec, prompt=prompt), threading.Event())
+    assert outcome.status == "completed"
+    assert outcome.answer == ""
+    assert outcome.metadata["output_warnings"] == [
+        {"code": "unsupported_content", "content_type": "image", "count": 1},
+    ]
+
+
+@pytest.mark.parametrize("result,expected", [(None, "Usable assistant text"), ("", "")])
+def test_unsupported_final_payload_keeps_assistant_text_but_explicit_empty_text_wins(spec, result, expected):
+    prompt = json.dumps({"assistant_messages": [[{"type": "text", "text": "Usable assistant text"}]],
+                         "answer": result})
+    outcome = run_claude(replace(spec, prompt=prompt), threading.Event())
+    assert outcome.status == "completed"
+    assert outcome.answer == expected
+    assert bool(outcome.metadata["output_warnings"]) == (result is None)
+    assert (spec.run_dir / "answer.full.md").read_text() == expected
+
+
+@pytest.mark.parametrize("content,count", [
+    ([{"type": "text", "text": 42}, None, "unexpected", {}, {"type": ["image"]},
+      {"type": "<script>unsafe-name</script>"}, {"type": "x" * 10000}], 7),
+    (None, 1),
+    ("unexpected content shape", 1),
+    ({"payload": "unexpected content shape"}, 1),
+])
+def test_malformed_assistant_content_is_visible_without_parser_failure(spec, content, count):
+    prompt = json.dumps({"assistant_messages": [content], "answer": "Final text"})
+    outcome = run_claude(replace(spec, prompt=prompt), threading.Event())
+    assert outcome.status == "completed"
+    assert outcome.answer == "Final text"
+    assert outcome.metadata["output_warnings"] == [
+        {"code": "unsupported_content", "content_type": "unknown", "count": count},
+    ]
+
+
+@pytest.mark.parametrize("result", [
+    [{"type": "text", "text": "**Supported text**"}, {"type": "image", "data": "hidden-image"}],
+    {"content": [{"type": "text", "text": "**Supported text**"},
+                 {"type": "image", "data": "hidden-image"}]},
+])
+def test_structured_final_result_extracts_text_without_serializing_nontext(spec, result):
+    outcome = run_claude(replace(spec, prompt=json.dumps({"answer": result})), threading.Event())
+    assert outcome.status == "completed"
+    assert outcome.answer == "**Supported text**"
+    assert outcome.metadata["output_warnings"] == [
+        {"code": "unsupported_content", "content_type": "image", "count": 1},
+    ]
+    assert "hidden-image" not in json.dumps(outcome.metadata)
+    assert (spec.run_dir / "answer.full.md").read_text() == "**Supported text**"
+
+
+@pytest.mark.parametrize("result,answer,warnings", [
+    ({"type": "text", "text": "A text block"}, "A text block", []),
+    ({"type": "image", "data": "hidden-image"}, "",
+     [{"code": "unsupported_content", "content_type": "image", "count": 1}]),
+])
+def test_single_content_block_final_result(spec, result, answer, warnings):
+    outcome = run_claude(replace(spec, prompt=json.dumps({"answer": result})), threading.Event())
+    assert outcome.status == "completed"
+    assert outcome.answer == answer
+    assert outcome.metadata["output_warnings"] == warnings
+    assert "hidden-image" not in json.dumps(outcome.metadata)
+
+
+@pytest.mark.parametrize("result", [
+    {"payload": "hidden-unknown-result"},
+    17,
+    None,
+    [{"type": "text", "text": {"payload": "hidden-unknown-result"}}],
+])
+def test_unrecognized_final_result_is_reported_without_copying_raw_data(spec, result):
+    outcome = run_claude(replace(spec, prompt=json.dumps({"answer": result})), threading.Event())
+    assert outcome.status == "completed"
+    assert outcome.answer == ""
+    assert outcome.metadata["output_warnings"] == [
+        {"code": "unsupported_content", "content_type": "unknown", "count": 1},
+    ]
+    assert "hidden-unknown-result" not in json.dumps(outcome.metadata)
+
+
+def test_unsupported_content_warnings_bound_type_count_and_omit_unsafe_names(spec):
+    payload = "private-content:" + "b" * 20000
+    content = [{"type": f"custom_{index}", "payload": payload} for index in range(40)]
+    content.extend([{"type": "<script>unsafe-name</script>", "payload": payload},
+                    {"type": "x" * 10000, "payload": payload},
+                    {"type": "custom_0", "payload": payload}])
+    prompt = json.dumps({"assistant_messages": [content], "answer": "Done"})
+    outcome = run_claude(replace(spec, prompt=prompt), threading.Event())
+    warnings = outcome.metadata["output_warnings"]
+    assert outcome.status == "completed"
+    assert len(warnings) <= 17
+    assert sum(item["count"] for item in warnings) == len(content)
+    assert any(item["content_type"] == "other" for item in warnings)
+    assert next(item["count"] for item in warnings if item["content_type"] == "custom_0") == 2
+    assert all(set(item) == {"code", "content_type", "count"} for item in warnings)
+    serialized = json.dumps(outcome.metadata)
+    assert len(serialized) < 10000
+    assert "unsafe-name" not in serialized
+    assert payload not in serialized
+    assert outcome.answer == "Done"

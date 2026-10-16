@@ -28,6 +28,6 @@ Code lives on `main`. The separate orphan `mailbox` branch contains `.mailbox.js
 - Commit differences identify new inputs; indexed SQLite queries keep completed history out of routine scheduling. Durable ingestion checkpoints are separate from Git validation and publication.
 - Durable results and a SQLite publication outbox. Network retries never rerun a completed request.
 - Interrupted executions become `unknown` and freeze the workspace until an explicit recovery closes the interrupted request.
-- Markdown and small PNG, JPEG, or WebP attachments; large data stays on the server.
+- Claude is instructed to answer in GitHub-flavored Markdown and export charts as small static PNG, JPEG, or WebP images. Unsupported response content is omitted with a visible notice and diagnostic metadata; large data stays on the server.
 
 Use a repository whose writers are trusted to run code as the server account. Workspace validation restricts the starting directory to the server home; it is not an operating-system sandbox. Run exactly one server state directory per mailbox branch. Linux local operation is verified; AWS deployment remains a separate step.

@@ -191,6 +191,34 @@ def test_two_turns_resume_and_preserve_unicode(harness):
     assert str(harness.workspace) in serialized
 
 
+def test_unsupported_output_notice_and_metadata_are_published_without_failing_turn(harness):
+    secret = "private-inline-image-payload"
+    prompt = json.dumps({"assistant_messages": [[{"type": "image", "data": secret}]],
+                         "answer": "", "image": True})
+    sid, rid = harness.submit(prompt)
+    result = harness.result(sid, rid)
+    answer = harness.answer(sid, rid)
+    assert result["status"] == "completed"
+    assert result["revision"] == 1
+    assert result["metadata"]["output_warnings"] == [
+        {"code": "unsupported_content", "content_type": "image", "count": 1},
+    ]
+    assert answer.startswith("> **Output notice:**")
+    assert "artifacts/preview.png" in answer
+    assert len(result["artifacts"]) == 1
+    assert secret not in answer
+    assert secret not in json.dumps(result)
+
+    followup = harness.send(sid, json.dumps({"answer": "**Readable** reply"}), revision=1)
+    second = harness.result(sid, followup)
+    assert second["status"] == "completed"
+    assert second["revision"] == 2
+    assert second["metadata"]["output_warnings"] == []
+    assert harness.answer(sid, followup) == "**Readable** reply"
+    assert len(harness.invocations()) == 2
+    assert harness.invocations()[1]["resume"]
+
+
 def test_duplicate_request_does_not_execute_twice(harness):
     session_id, request_id = harness.submit()
     harness.result(session_id, request_id)

@@ -19,6 +19,10 @@ CORE_TOOLS = "Read,Write,Edit,Glob,Grep,Bash,WebFetch,WebSearch"
 _LOG_BYTES = 2 * 1024 * 1024
 _MAX_LINE_BYTES = 2 * 1024 * 1024
 _MAX_ANSWER_BYTES = 512 * 1024
+_MAX_OUTPUT_TYPES = 16
+_INTERNAL_CONTENT_TYPES = frozenset({
+    "tool_use", "server_tool_use", "tool_result", "thinking", "redacted_thinking",
+})
 _GRACE_SECONDS = 0.3
 
 
@@ -221,12 +225,22 @@ def run_claude(
     instruction = (
         "This turn is executed unattended. Do not wait for human interaction or use interactive "
         "programs. If information is missing, return a concise question as your final answer. "
+        "Return your final answer as GitHub-flavored Markdown in the user's language. Use "
+        "ordinary paragraphs, headings, lists, tables, and fenced code blocks as appropriate; "
+        "do not wrap the entire answer in a code fence. The reply is stored as answer.md. "
+        "Do not rely on raw HTML, JavaScript, embedded widgets, or interactive plots for display. "
+        "Render charts and diagrams as supported static images, or provide a text explanation "
+        "if image export is unavailable. Code requested by the user can appear in fenced code blocks. "
         "Export only small static PNG, JPEG or WebP images intended for the user directly into "
         f"this turn's export directory: {export_dir.resolve()}. "
         "Do not export data files, archives, videos, model weights, or inline base64 data. "
         "Keep each image below 2 MiB, at most 10 images and 10 MiB total. "
-        "Leave large data in the workspace and mention its server path. External HTTP(S) links "
-        "may appear in your Markdown answer. Exported images will receive relative links automatically."
+        "Leave unsupported files and large data in the workspace, mention their server paths as "
+        "inline code, and explain that they require separate transfer. Do not create Markdown "
+        "links to server-local paths or file:// URLs. External HTTP(S) links may appear in your "
+        "Markdown answer. Exported images will receive relative links automatically; do not "
+        "link to the export directory yourself. If a requested format cannot be delivered through "
+        "this channel, explain the limitation in your final answer."
     )
     args = [spec.executable, "-p", "--output-format", "stream-json", "--verbose",
             "--model", spec.model, "--effort", spec.effort,
@@ -241,7 +255,7 @@ def run_claude(
         args.extend(["--max-budget-usd", str(spec.max_budget_usd)])
     metadata: dict = {"claude_session_id": spec.claude_session_id, "model": spec.model,
                       "effort": spec.effort, "permission_denials": [], "malformed_events": 0,
-                      "oversized_events": 0, "resume": spec.resume}
+                      "oversized_events": 0, "output_warnings": [], "resume": spec.resume}
     try:
         process = subprocess.Popen(args, cwd=spec.workspace, env=_child_environment(),
                                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -259,7 +273,9 @@ def run_claude(
                 if stream:
                     stream.close()
             raise
-    state: dict = {"result": None, "initialized": False, "last_text": "", "io_errors": []}
+    state: dict = {"result": None, "result_text": None, "initialized": False,
+                  "last_text": "", "io_errors": []}
+    unsupported_counts: dict[str, int] = {}
     started = time.monotonic()
 
     def record_io_error(message: str) -> None:
@@ -290,6 +306,37 @@ def run_claude(
             os.fsync(handle.fileno())
         os.replace(temporary, run_dir / "answer.full.md")
 
+    def record_unsupported(content_type=None) -> None:
+        # Keep only bounded type identifiers and counts, never content payloads.
+        if not isinstance(content_type, str) or not re.fullmatch(r"[a-z][a-z0-9_]{0,63}", content_type):
+            content_type = "unknown"
+        if content_type not in unsupported_counts and len(unsupported_counts.keys() - {"other"}) >= _MAX_OUTPUT_TYPES:
+            content_type = "other"
+        unsupported_counts[content_type] = unsupported_counts.get(content_type, 0) + 1
+
+    def extract_content_text(content) -> str:
+        if isinstance(content, dict):
+            content = [content] if "type" in content else content.get("content")
+        if not isinstance(content, list):
+            record_unsupported()
+            return ""
+        text = []
+        for block in content:
+            if not isinstance(block, dict):
+                record_unsupported()
+                continue
+            kind = block.get("type")
+            if kind == "text":
+                if isinstance(block.get("text"), str):
+                    text.append(block["text"])
+                else:
+                    record_unsupported()
+            elif isinstance(kind, str) and kind in _INTERNAL_CONTENT_TYPES:
+                continue
+            else:
+                record_unsupported(kind)
+        return "\n".join(text)
+
     def event(line: bytes) -> None:
         if not line.strip():
             return
@@ -311,17 +358,24 @@ def run_claude(
                 metadata["actual_model"] = _short_text(value["model"], 256)
         elif value.get("type") == "assistant":
             message = value.get("message", {})
-            blocks = message.get("content", []) if isinstance(message, dict) else []
-            if isinstance(blocks, list):
-                text = "\n".join(block.get("text", "") for block in blocks
-                                 if isinstance(block, dict) and block.get("type") == "text"
-                                 and isinstance(block.get("text"), str))
-                if text:
-                    state["last_text"] = text.encode("utf-8")[:_MAX_ANSWER_BYTES].decode("utf-8", errors="ignore")
+            blocks = message.get("content") if isinstance(message, dict) else None
+            text = extract_content_text(blocks)
+            if text:
+                state["last_text"] = text.encode("utf-8")[:_MAX_ANSWER_BYTES].decode("utf-8", errors="ignore")
         elif value.get("type") == "result":
             state["result"] = value
             if isinstance(value.get("result"), str):
+                state["result_text"] = value["result"].encode("utf-8")[:_MAX_ANSWER_BYTES].decode("utf-8", errors="ignore")
                 persist_full_answer(value["result"])
+            elif "result" in value or (value.get("subtype") == "success" and not value.get("is_error")):
+                text = extract_content_text(value.get("result"))
+                # Preserve usable assistant text if an unsupported final payload
+                # contains no text. An explicit string result still takes priority.
+                state["result_text"] = (
+                    text.encode("utf-8")[:_MAX_ANSWER_BYTES].decode("utf-8", errors="ignore")
+                    if text else None
+                )
+                persist_full_answer(text or state["last_text"])
             if value.get("subtype") == "success" and not value.get("is_error"):
                 mark_initialized()
 
@@ -398,13 +452,17 @@ def run_claude(
     metadata["exit_code"] = process.poll()
     metadata["duration_seconds"] = round(time.monotonic() - started, 3)
     metadata["io_errors"] = state["io_errors"]
+    metadata["output_warnings"] = [
+        {"code": "unsupported_content", "content_type": kind, "count": count}
+        for kind, count in sorted(unsupported_counts.items())
+    ]
     result = state["result"]
     answer = state["last_text"]
     error: str | None = None
     status = "completed"
     if result:
-        if isinstance(result.get("result"), str):
-            answer = result["result"].encode("utf-8")[:_MAX_ANSWER_BYTES].decode("utf-8", errors="ignore")
+        if state["result_text"] is not None:
+            answer = state["result_text"]
         for key in ("subtype", "is_error", "total_cost_usd", "usage", "modelUsage", "duration_ms",
                     "duration_api_ms", "num_turns"):
             if key in result:

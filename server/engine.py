@@ -579,7 +579,8 @@ class Engine:
         run_dir = self.state_dir / "runs" / rid
         answer = outcome.answer or (f"Request {outcome.status}.\n\n{outcome.error}\n" if outcome.error else "")
         bundle = collect_artifacts(run_dir / "exports", answer, self.config.get("artifact_limits"),
-                                   remaining_bytes=max(0, self.config["image_budget_bytes"] - self.store.image_bytes()))
+                                   remaining_bytes=max(0, self.config["image_budget_bytes"] - self.store.image_bytes()),
+                                   output_warnings=outcome.metadata.get("output_warnings"))
         settings = json.loads(session["settings_json"])
         result = {"schema_version": 1, "session_id": session["session_id"], "request_id": rid,
                   "status": outcome.status, "accepted": accepted, "revision": revision,

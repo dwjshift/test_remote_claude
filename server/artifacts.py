@@ -110,6 +110,7 @@ def collect_artifacts(
     limits: dict | None = None,
     *,
     remaining_bytes: int,
+    output_warnings: list[dict] | None = None,
 ) -> ArtifactBundle:
     """Collect small static images only; no network calls or project-wide scans.
 
@@ -213,5 +214,12 @@ def collect_artifacts(
     safe_answer = _DATA_URI.sub("[inline data omitted]", str(answer))
     if notes:
         safe_answer += "\n\n" + "\n\n".join(notes)
+    if output_warnings:
+        safe_answer = (
+            "> **Output notice:** Some Claude content could not be included in this Markdown reply. "
+            "Ask for a text explanation or a static PNG, JPEG, or WebP image if needed. "
+            "Details are recorded in `result.json` under `metadata.output_warnings`.\n\n"
+            + safe_answer
+        )
     safe_answer = _bounded_text(safe_answer, policy["text_limit"])
     return ArtifactBundle(safe_answer, files, artifacts, skipped, total)
