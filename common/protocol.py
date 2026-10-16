@@ -5,12 +5,16 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-from datetime import datetime, timezone
+import re
+from datetime import datetime, timedelta, timezone
 from typing import Any
-from uuid import UUID
+from uuid import UUID, uuid4
 
 
 SCHEMA_VERSION = 1
+ID_TIMEZONE = timezone(timedelta(hours=-8), name="PST")
+ID_TIMESTAMP_FORMAT = "%Y%m%dT%H%M%S%z"
+_ID_TIMESTAMP = re.compile(r"[0-9]{8}T[0-9]{6}-0800")
 TERMINAL_STATES = frozenset(
     {"completed", "failed", "cancelled", "timed_out", "interrupted", "rejected"}
 )
@@ -41,15 +45,39 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
+def new_id(now: datetime | None = None) -> str:
+    """Generate a second-precision PST timestamp with a unique random suffix.
+
+    A fixed UTC-08:00 offset avoids daylight-saving clock rollback. The UUID
+    preserves uniqueness across clients that generate IDs in the same second.
+    """
+    moment = datetime.now(timezone.utc) if now is None else now
+    if moment.utcoffset() is None:
+        raise ValueError("ID timestamps must be timezone-aware")
+    timestamp = moment.astimezone(ID_TIMEZONE).strftime(ID_TIMESTAMP_FORMAT)
+    return f"{timestamp}_{uuid4()}"
+
+
 def validate_id(value: str) -> str:
+    """Accept timestamp-prefixed IDs and existing canonical UUID identifiers."""
+    error = "IDs must be a fixed-PST timestamp followed by a canonical UUID, or a legacy canonical UUID"
     if not isinstance(value, str):
-        raise ProtocolError("IDs must be canonical UUID strings")
+        raise ProtocolError(error)
+    suffix = value
+    if "_" in value:
+        timestamp, suffix = value.split("_", 1)
+        if not _ID_TIMESTAMP.fullmatch(timestamp):
+            raise ProtocolError(error)
+        try:
+            datetime.strptime(timestamp, ID_TIMESTAMP_FORMAT)
+        except ValueError as exc:
+            raise ProtocolError("ID timestamp must contain a valid calendar date and time") from exc
     try:
-        parsed = UUID(value)
+        parsed = UUID(suffix)
     except (ValueError, AttributeError) as exc:
-        raise ProtocolError("IDs must be canonical UUID strings") from exc
-    if str(parsed) != value:
-        raise ProtocolError("IDs must be lowercase, hyphenated UUID strings")
+        raise ProtocolError(error) from exc
+    if str(parsed) != suffix:
+        raise ProtocolError("ID UUID suffixes must be lowercase and hyphenated")
     return value
 
 

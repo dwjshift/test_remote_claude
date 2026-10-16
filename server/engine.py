@@ -16,7 +16,7 @@ import time
 from uuid import uuid4
 
 from common.git_transport import GitMailbox
-from common.protocol import (ProtocolError, canonical_json, content_hash, utc_now,
+from common.protocol import (ProtocolError, canonical_json, content_hash, new_id, utc_now,
                              validate_control, validate_id, validate_request, validate_session)
 from .artifacts import collect_artifacts
 from .publication import validate_publication
@@ -168,7 +168,7 @@ class Engine:
     def _queue_snapshot(self, db, session_id: str, event: str, **overrides) -> None:
         session = dict(db.execute("SELECT * FROM sessions WHERE session_id=?", (session_id,)).fetchone())
         snapshot = self._snapshot(session, **overrides)
-        event_id = str(uuid4())
+        event_id = new_id()
         status_path = f"sessions/{session_id}/status.json"
         Store.enqueue(db, event_id, {status_path: canonical_json(snapshot),
                       f"sessions/{session_id}/events/{event_id}.json": canonical_json({
@@ -256,7 +256,7 @@ class Engine:
             if existing:
                 if existing["body_hash"] != digest:
                     key = f"content-conflict:{rid}:{digest}"
-                    event_id = str(uuid4())
+                    event_id = new_id()
                     with self.store.transaction() as db:
                         Store.enqueue(db, key, {f"sessions/{sid}/events/{event_id}.json": canonical_json({
                             "kind": "immutable_request_conflict", "request_id": rid,

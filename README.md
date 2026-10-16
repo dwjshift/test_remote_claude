@@ -20,6 +20,7 @@ Code lives on `main`. The separate orphan `mailbox` branch contains `.mailbox.js
 ## Behavior
 
 - Claude Code **2.1.300**, print mode, structured output, `auto` permissions, and no permission prompts. The server pins the resolved executable when it starts.
+- New session and request IDs start with a second-precision timestamp in fixed PST (UTC-08:00). Responses share their request ID; existing UUID identifiers remain supported.
 - One unfinished request per conversation; explicit revisions and deterministic conflict rejection.
 - Up to ten concurrent turns in independent workspaces. Equal or nested workspaces are serialized. Idle conversations keep their history without retaining a Claude process.
 - Durable results and a SQLite publication outbox. Network retries never rerun a completed request.

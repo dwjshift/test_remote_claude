@@ -143,10 +143,10 @@ After a crash during execution, the request becomes `unknown`. Its session and o
 5. Acknowledge the interruption and wait for its terminal result:
 
 ```bash
-remote-claude-client --config .runtime/client.json show SESSION_UUID
-remote-claude-client --config .runtime/client.json cancel SESSION_UUID --request-id REQUEST_UUID
-remote-claude-client --config .runtime/client.json recover SESSION_UUID --acknowledge
-remote-claude-client --config .runtime/client.json watch SESSION_UUID --request-id REQUEST_UUID
+remote-claude-client --config .runtime/client.json show SESSION_ID
+remote-claude-client --config .runtime/client.json cancel SESSION_ID --request-id REQUEST_ID
+remote-claude-client --config .runtime/client.json recover SESSION_ID --acknowledge
+remote-claude-client --config .runtime/client.json watch SESSION_ID --request-id REQUEST_ID
 ```
 
 `recover` records `interrupted`, advances the revision once, and releases the frozen workspace after verified shutdown. It acknowledges possible partial side effects; it does not undo them. Submit a **new** prompt to continue. If native session initialization was recorded, that next turn resumes the original context.
@@ -168,13 +168,26 @@ remote-claude-client --config .runtime/client.json new \
   --prompt 'Inspect this project and summarize its structure.'
 ```
 
-The command prints the session and request UUIDs. Use those values in the following commands; the uppercase UUID placeholders are not literal IDs.
+The command prints the session and request IDs. New IDs use this format:
+
+```text
+20261015T184530-0800_550e8400-e29b-41d4-a716-446655440000
+YYYYMMDDTHHMMSS-0800_<random-uuid>
+```
+
+The prefix records creation time to the second in **fixed Pacific Standard Time (PST, UTC-08:00)** on every machine. It does not depend on the host timezone and does not switch to daylight time in summer. This avoids filenames moving backward during the autumn clock change. The UUID suffix prevents collisions when multiple clients create IDs in the same second; IDs within that second sort by their suffix. Keep machine clocks synchronized, since timezone normalization cannot correct clock skew.
+
+Session directories, request filenames, control IDs, and event IDs use this convention. Response directories reuse their request ID so matching requests and responses sort together; their prefix represents request creation time, not response completion time. Structured `created_at` and execution timestamps remain ISO 8601 UTC values.
+
+Existing UUID-only IDs remain readable, resumable, and valid for retries; existing files are not renamed. Upgrade both the client and server before using the new timestamp format. Claude's internal native session UUID remains separate from these mailbox IDs and is still used for `--resume`.
+
+Use the printed values in the following commands; the uppercase ID placeholders are not literal IDs.
 
 ```bash
 remote-claude-client --config .runtime/client.json list
-remote-claude-client --config .runtime/client.json show SESSION_UUID
-remote-claude-client --config .runtime/client.json watch SESSION_UUID --request-id REQUEST_UUID
-remote-claude-client --config .runtime/client.json send SESSION_UUID \
+remote-claude-client --config .runtime/client.json show SESSION_ID
+remote-claude-client --config .runtime/client.json watch SESSION_ID --request-id REQUEST_ID
+remote-claude-client --config .runtime/client.json send SESSION_ID \
   --prompt 'Continue with the smallest useful implementation change.'
 ```
 
@@ -183,22 +196,22 @@ remote-claude-client --config .runtime/client.json send SESSION_UUID \
 Use UTF-8 files or stdin for longer prompts:
 
 ```bash
-remote-claude-client --config .runtime/client.json send SESSION_UUID --prompt-file prompt.txt
+remote-claude-client --config .runtime/client.json send SESSION_ID --prompt-file prompt.txt
 printf '%s\n' 'Review the previous changes and report remaining problems.' | \
-  remote-claude-client --config .runtime/client.json send SESSION_UUID --prompt-file -
+  remote-claude-client --config .runtime/client.json send SESSION_ID --prompt-file -
 ```
 
 Prompt and response text is preserved in its original language. A complete prompt JSON message, including its metadata, must fit within 1 MiB. `--json` emits machine-readable output; `watch --json` emits JSON Lines when snapshots change. `show` returns response metadata and local answer paths. Open `answer.md` from the local mailbox cache or on GitHub to view its relative image links.
 
-Only one ordinary request may be unfinished per session. Wait for its result before sending another. The client normally uses the latest published revision; `send --expected-revision N` additionally asserts the revision you intend. Simultaneous requests at the same revision are sorted by request UUID by the server; one is accepted and the others receive `rejected` without advancing the revision.
+Only one ordinary request may be unfinished per session. Wait for its result before sending another. The client normally uses the latest published revision; `send --expected-revision N` additionally asserts the revision you intend. Simultaneous requests at the same revision are sorted by request ID by the server; one is accepted and the others receive `rejected` without advancing the revision.
 
 For safe retries, retain IDs printed on submission failure and repeat with `--session-id`, `--request-id`, or `--control-id` as appropriate. Identical content with an existing ID is idempotent; different content is rejected. Do not generate a new ID merely because a push acknowledgement was lost.
 
 Cancel a request or close a conversation:
 
 ```bash
-remote-claude-client --config .runtime/client.json cancel SESSION_UUID --request-id REQUEST_UUID
-remote-claude-client --config .runtime/client.json close SESSION_UUID
+remote-claude-client --config .runtime/client.json cancel SESSION_ID --request-id REQUEST_ID
+remote-claude-client --config .runtime/client.json close SESSION_ID
 ```
 
 Controls are asynchronous and take effect when the server next polls. `close` prevents new requests and cancels unfinished work; it does not delete the history or workspace. Published control acknowledgements appear in `show`. Accepted completed, failed, cancelled, timed-out, and interrupted turns each advance the revision once. Rejected requests do not.
@@ -208,16 +221,16 @@ Controls are asynchronous and take effect when the server next polls. `close` pr
 Each conversation on the data branch has this structure:
 
 ```text
-sessions/<session-uuid>/
+sessions/<session-id>/
   settings.json
-  requests/<request-uuid>.json
-  responses/<request-uuid>/
+  requests/<request-id>.json
+  responses/<request-id>/
     result.json
     answer.md
     artifacts/<image-name>
-  controls/<control-uuid>.json
-  controls/results/<control-uuid>.json
-  events/<event-uuid>.json
+  controls/<control-id>.json
+  controls/results/<control-id>.json
+  events/<event-id>.json
   status.json
 ```
 
@@ -250,7 +263,7 @@ python scripts/live_smoke.py --budget 1 --timeout 120
 
 It runs the real client commands and server engine, writes a synthetic file through Claude, sends a second prompt with the same native session UUID, verifies Read/Bash tool calls, and publishes a small PNG, UTF-8 text, and a hyperlink. It also verifies an explicit permission denial in `auto` mode and a short real CLI timeout. The budget is passed to each Claude invocation; CLI-reported costs are diagnostic totals, not a statement of actual billed charges.
 
-The final line prints the unique run directory. To continue using the generated local pair, substitute that path below. Its report records the created session UUID.
+The final line prints the unique run directory. To continue using the generated local pair, substitute that path below. Its report records the created mailbox session ID.
 
 Terminal 1:
 
@@ -265,10 +278,10 @@ Terminal 2:
 ```bash
 source .venv/bin/activate
 remote-claude-client --config .runtime/live/RUN_ID/client.json list
-remote-claude-client --config .runtime/live/RUN_ID/client.json show SESSION_UUID
-remote-claude-client --config .runtime/live/RUN_ID/client.json send SESSION_UUID \
+remote-claude-client --config .runtime/live/RUN_ID/client.json show SESSION_ID
+remote-claude-client --config .runtime/live/RUN_ID/client.json send SESSION_ID \
   --prompt 'Read the synthetic token file again and summarize the current workspace.'
-remote-claude-client --config .runtime/live/RUN_ID/client.json watch SESSION_UUID
+remote-claude-client --config .runtime/live/RUN_ID/client.json watch SESSION_ID
 ```
 
 Stop both foreground commands with Ctrl+C when finished. All local smoke data remains ignored by Git for review. Local smoke branches intentionally remain in their disposable bare repositories; successful real GitHub smoke branches are deleted.

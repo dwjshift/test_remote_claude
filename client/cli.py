@@ -9,12 +9,11 @@ import sys
 import time
 from pathlib import Path
 from typing import Any
-from uuid import uuid4
 
 from common.config import ConfigError, DEFAULT_CONFIG_PATH, load_config, save_config
 from common.git_transport import GitError, GitMailbox, ImmutableConflict
 from common.protocol import (
-    ProtocolError, TERMINAL_STATES, canonical_json, utc_now, validate_control,
+    ProtocolError, TERMINAL_STATES, canonical_json, new_id, utc_now, validate_control,
     validate_id, validate_request, validate_session,
 )
 
@@ -205,7 +204,7 @@ def _init(args: argparse.Namespace) -> dict:
 
 def _new(args: argparse.Namespace, config: dict) -> dict:
     mailbox = _mailbox(config)
-    session_id = validate_id(args.session_id or str(uuid4()))
+    session_id = validate_id(args.session_id or new_id())
     args.session_id = session_id
     settings = validate_session({
         "schema_version": 1, "session_id": session_id, "workspace": args.workspace,
@@ -226,7 +225,7 @@ def _new(args: argparse.Namespace, config: dict) -> dict:
         raise ClientError("--request-id requires an initial prompt")
     request = None
     if prompt is not None:
-        request_id = validate_id(args.request_id or str(uuid4()))
+        request_id = validate_id(args.request_id or new_id())
         args.request_id = request_id
         request = _existing_request(directory, mailbox, request_id, prompt, 0)
         if request is None:
@@ -247,7 +246,7 @@ def _send(args: argparse.Namespace, config: dict) -> dict:
     mailbox = _mailbox(config)
     directory, _, status = _session(mailbox, args.session_id)
     prompt = _prompt(args)
-    request_id = validate_id(args.request_id or str(uuid4()))
+    request_id = validate_id(args.request_id or new_id())
     args.request_id = request_id
     existing = _existing_request(directory, mailbox, request_id, prompt, args.expected_revision)
     if existing is not None:
@@ -320,7 +319,7 @@ def _show(mailbox: GitMailbox, session_id: str, request_id: str | None = None) -
 def _control(args: argparse.Namespace, config: dict) -> dict:
     mailbox = _mailbox(config)
     directory, _, status = _session(mailbox, args.session_id)
-    control_id = validate_id(args.control_id or str(uuid4()))
+    control_id = validate_id(args.control_id or new_id())
     args.control_id = control_id
     name = f"sessions/{args.session_id}/controls/{control_id}.json"
     existing_path = mailbox.path / name
@@ -436,8 +435,8 @@ def build_parser() -> argparse.ArgumentParser:
     new = commands.add_parser("new", help="Create a session, optionally including its first prompt")
     _common_arguments(new, True)
     new.add_argument("--workspace", required=True, help="Server directory such as '~/projects/example'")
-    new.add_argument("--session-id", help="Stable session UUID for retrying creation")
-    new.add_argument("--request-id", help="Stable initial request UUID")
+    new.add_argument("--session-id", help="Stable session ID for retrying creation (timestamp ID or legacy UUID)")
+    new.add_argument("--request-id", help="Stable initial request ID (timestamp ID or legacy UUID)")
     new.add_argument("--model", default="sonnet")
     new.add_argument("--effort", default="high")
     new.add_argument("--timeout", "--timeout-seconds", type=float, default=3600, dest="timeout")
@@ -446,7 +445,7 @@ def build_parser() -> argparse.ArgumentParser:
     send = commands.add_parser("send", help="Submit the next prompt in a session")
     _common_arguments(send, True)
     send.add_argument("session_id")
-    send.add_argument("--request-id", help="Stable request UUID for safe submission retries")
+    send.add_argument("--request-id", help="Stable request ID for safe submission retries (timestamp ID or legacy UUID)")
     send.add_argument("--expected-revision", type=int)
     _prompt_arguments(send)
 
@@ -467,7 +466,7 @@ def build_parser() -> argparse.ArgumentParser:
         sub = commands.add_parser(command, help=f"Submit a {command} control message")
         _common_arguments(sub, True)
         sub.add_argument("session_id")
-        sub.add_argument("--control-id", help="Stable control UUID")
+        sub.add_argument("--control-id", help="Stable control ID (timestamp ID or legacy UUID)")
         if command == "cancel":
             sub.add_argument("--request-id", help="Request to cancel (defaults to the active request)")
         if command == "recover":

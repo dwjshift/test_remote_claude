@@ -1,9 +1,10 @@
 import io
 import json
 from pathlib import Path
+import re
 import subprocess
 import time
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 
@@ -11,6 +12,11 @@ from client.cli import build_parser, main
 from common.config import load_config, save_config
 from common.git_transport import GitMailbox
 from common.protocol import canonical_json
+
+
+def assert_timestamp_id(identifier):
+    assert re.fullmatch(r"[0-9]{8}T[0-9]{6}-0800_[a-f0-9-]{36}", identifier)
+    assert str(UUID(identifier.split("_", 1)[1])) == identifier.split("_", 1)[1]
 
 
 @pytest.fixture
@@ -33,6 +39,7 @@ def test_client_session_prompt_retry_and_published_response(client_setup, tmp_pa
     remote, config, call = client_setup
     created = call("new", "--workspace", "~/projects/demo")
     session_id = created["session_id"]
+    assert_timestamp_id(session_id)
     request_id = str(uuid4())
     sent = call("send", session_id, "--prompt", "Inspect the project", "--request-id", request_id)
     retry = call("send", session_id, "--prompt", "Inspect the project", "--request-id", request_id)
@@ -56,6 +63,7 @@ def test_client_session_prompt_retry_and_published_response(client_setup, tmp_pa
     next_request = call("send", session_id, "--prompt", "Continue", "--expected-revision", "1")
     assert next_request["expected_revision"] == 1
     assert next_request["request_id"] != request_id
+    assert_timestamp_id(next_request["request_id"])
 
 
 def test_new_can_atomically_include_initial_prompt_from_stdin(client_setup, monkeypatch):
@@ -83,6 +91,8 @@ def test_cancel_close_recover_controls_and_watch_once(client_setup):
     cancel = call("cancel", session_id)
     close = call("close", session_id)
     recover = call("recover", session_id, "--acknowledge")
+    for control in (cancel, close, recover):
+        assert_timestamp_id(control["control_id"])
     root = load_config(config)["state_dir"]
     directory = Path(root) / "mailbox" / "sessions" / session_id / "controls"
     cancel_data = json.loads((directory / f"{cancel['control_id']}.json").read_text())
@@ -133,17 +143,24 @@ def test_local_remote_from_init_survives_a_change_of_working_directory(tmp_path,
     assert json.loads(capsys.readouterr().out) == []
 
 
+@pytest.mark.parametrize("legacy_session", [False, True])
 def test_cli_roundtrip_with_real_engine_and_fake_claude(
-    client_setup, tmp_path, workspace, fake_claude, fake_state,
+    client_setup, tmp_path, workspace, fake_claude, fake_state, legacy_session,
 ):
     from server.engine import Engine
 
-    remote, _, call = client_setup
+    remote, client_config, call = client_setup
+    identity = ["--session-id", str(uuid4())] if legacy_session else []
     created = call(
         "new", "--workspace", "~/" + str(workspace.relative_to(Path.home())),
-        "--prompt", "First turn through the CLI",
+        "--prompt", "First turn through the CLI", *identity,
     )
     session_id = created["session_id"]
+    if not legacy_session:
+        assert_timestamp_id(session_id)
+    assert_timestamp_id(created["request_id"])
+    session_directory = Path(load_config(client_config)["state_dir"]) / "mailbox" / "sessions" / session_id
+    assert (session_directory / "requests" / f"{created['request_id']}.json").is_file()
     config = {
         "remote": str(remote), "state_dir": str(tmp_path / "server-state"),
         "claude_executable": str(fake_claude), "poll_interval": 0,
@@ -163,10 +180,25 @@ def test_cli_roundtrip_with_real_engine_and_fake_claude(
         first = wait_for_response(created["request_id"])
         assert first["status"] == "completed"
         assert first["revision"] == 1
+        assert Path(first["answer_path"]).parent.name == created["request_id"]
         assert call("watch", session_id, "--request-id", created["request_id"])["responses"][0]["status"] == "completed"
         second = call("send", session_id, "--prompt", "Second turn through the CLI")
+        assert_timestamp_id(second["request_id"])
+        assert created["request_id"].split("_", 1)[0] <= second["request_id"].split("_", 1)[0]
         assert second["expected_revision"] == 1
-        assert wait_for_response(second["request_id"])["status"] == "completed"
+        response = wait_for_response(second["request_id"])
+        assert response["status"] == "completed"
+        assert Path(response["answer_path"]).parent.name == second["request_id"]
+        assert response["claude_session_id"] == first["claude_session_id"]
+        assert str(UUID(response["claude_session_id"])) == response["claude_session_id"]
+        for event in (session_directory / "events").glob("*.json"):
+            assert_timestamp_id(event.stem)
         invocations = [json.loads(line) for line in (fake_state / "invocations.jsonl").read_text().splitlines()]
         assert len(invocations) == 2
         assert invocations[1]["resume"] is True
+        closed = call("close", session_id)
+        assert_timestamp_id(closed["control_id"])
+        engine.tick()
+        acknowledgements = call("show", session_id)["control_results"]
+        assert acknowledgements[0]["control_id"] == closed["control_id"]
+        assert acknowledgements[0]["status"] == "closed"

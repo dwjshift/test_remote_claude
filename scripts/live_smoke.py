@@ -28,7 +28,7 @@ from uuid import uuid4
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from common.protocol import TERMINAL_STATES  # noqa: E402
+from common.protocol import TERMINAL_STATES, validate_id  # noqa: E402
 from server.engine import Engine  # noqa: E402
 from server.runner import RunSpec, check_claude, run_claude  # noqa: E402
 
@@ -196,6 +196,9 @@ def run(arguments, directory: Path, report: dict) -> None:
     first = client(config, "new", "--workspace", workspace_arg, "--model", arguments.model,
                    "--effort", "low", "--timeout", str(arguments.timeout), "--prompt", first_prompt)
     session_id, first_id = first["session_id"], first["request_id"]
+    for identifier in (session_id, first_id):
+        require("_" in identifier and validate_id(identifier) == identifier,
+                "Client did not generate a timestamp-prefixed mailbox ID")
     report["session_id"] = session_id
     report["requests"] = [first_id]
     recorded: list[dict] = []
@@ -231,6 +234,8 @@ def run(arguments, directory: Path, report: dict) -> None:
         )
         second = client(config, "send", session_id, "--prompt", second_prompt)
         second_id = second["request_id"]
+        require("_" in second_id and validate_id(second_id) == second_id,
+                "Follow-up request did not use a timestamp-prefixed mailbox ID")
         report["requests"].append(second_id)
         print("Running real resumed turn: Read token and export a small PNG", flush=True)
         result = wait_for_result(engine, second_id, arguments.timeout)
@@ -243,6 +248,8 @@ def run(arguments, directory: Path, report: dict) -> None:
         require({"Read", "Bash"}.issubset(set(tool_names(second_events))), "Second turn did not call Read and Bash")
         view = client(config, "show", session_id, "--request-id", second_id)
         published = view["responses"][0]
+        require(Path(published["answer_path"]).parent.name == second_id,
+                "Response directory did not preserve its timestamp-prefixed request ID")
         answer = published["answer"]
         require(all(text in answer for text in ("SECOND_OK", token, UNICODE_MARKER, "https://example.com")),
                 "Published answer lost its token, UTF-8 text, or hyperlink")
