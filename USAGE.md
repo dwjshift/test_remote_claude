@@ -2,6 +2,8 @@
 
 This project uses a Git branch as an asynchronous transport between a client and an unattended Claude Code server. Both sides can run on the same Linux machine with independent state directories. Neither side needs an inbound network listener.
 
+For an EC2 instance with an existing Amazon Bedrock Claude installation, follow [EC2_SETUP.md](EC2_SETUP.md). It covers provider-specific compatibility work, real GitHub branch tests, verified client model choices, and persistent service installation. The local claude.ai authentication examples below are not a substitute for that Bedrock setup. No EC2 instance or Bedrock model has been certified by this document yet; the target agent must add a **Verified EC2 Deployment** section after testing the actual machine.
+
 ## Requirements and Installation
 
 - Python 3.11 or newer; validated here with Python 3.13.5.
